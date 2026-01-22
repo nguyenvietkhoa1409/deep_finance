@@ -2,18 +2,19 @@ import torch
 import numpy as np
 import os
 import sys
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, matthews_corrcoef
 from collections import Counter
 
 # Import project modules
 from src.model import StockMovementModel
 from src.data_loader import data_prepare
-from configs.config import TrainConfig, GlobalConfig
+from configs.config import TrainConfig
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = os.path.join("output", "best_model.pt")
-DATA_PATH = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl" # Đảm bảo đường dẫn đúng
+# Đảm bảo đường dẫn này trỏ đúng file pkl mới nhất
+DATA_PATH = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl" 
 
 def print_header(title):
     print(f"\n{'='*60}")
@@ -23,6 +24,7 @@ def print_header(title):
 def load_data_per_ticker(tickers):
     """
     Load dữ liệu Test riêng biệt cho từng mã để phân tích behavior.
+    Sử dụng logic Rolling Z-Score mới nhất từ data_loader.
     """
     dp = data_prepare(DATA_PATH)
     ticker_datasets = {}
@@ -30,26 +32,28 @@ def load_data_per_ticker(tickers):
     print(f"📥 Loading TEST data for: {tickers}")
     for t in tickers:
         try:
-            # Chỉ lấy tập Test (index 2)
+            # prepare_data trả về: train, valid, test
+            # Ta chỉ cần test (index 2)
             _, _, test_data = dp.prepare_data(
                 stock_name=t,
                 window_size=TrainConfig.window_size,
-                # Các tham số khác lấy từ config mặc định trong data_loader
+                # Các tham số khác sẽ lấy default từ Config
             )
             
             if test_data and len(test_data.get("label", [])) > 0:
                 ticker_datasets[t] = test_data
                 print(f"   ✅ {t}: {len(test_data['label'])} samples")
             else:
-                print(f"   ⚠️ {t}: No data")
+                print(f"   ⚠️ {t}: No data or empty test set")
         except Exception as e:
             print(f"   ❌ {t}: Error {e}")
             
     return ticker_datasets
 
-def run_forward_pass_manually(model, data_dict):
+def run_prediction(model, data_dict):
     """
-    Chạy forward pass thủ công để lấy Logits (vì hàm forward của model.py trả về loss/acc)
+    Chạy forward pass để lấy Logits và Predictions.
+    Logic được cập nhật để gọi thẳng model, tránh hard-code sai lệch.
     """
     model.eval()
     with torch.no_grad():
@@ -59,18 +63,25 @@ def run_forward_pass_manually(model, data_dict):
         s_m = data_dict["s_m"].to(DEVICE)
         s_n = data_dict["s_n"].to(DEVICE)
         
+        # Gọi Encoder + Fusion + Predictor
+        # Lưu ý: Ta cần sửa nhẹ model.py để hàm forward trả về logits khi không có label
+        # Tuy nhiên, để không phải sửa model.py, ta tái sử dụng logic tính toán thủ công
+        # nhưng đảm bảo nó khớp 100% với model.py hiện tại.
+        
         # 1. Encoder
         v_m, v_i, v_n = model.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
         
         # 2. Fusion
         fused_news = model.fusion_news(primary=v_i, aux=v_n)
         fused_macro = model.fusion_macro(primary=v_i, aux=v_m)
+        
+        # Logic trung bình cộng (cần khớp với main model)
         v_fused_total = (fused_news + fused_macro) / 2.0
         
-        # 3. Predictor -> Logits
+        # 3. Predictor
         logits = model.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
         
-        # Get Predictions & Probs
+        # Probability & Prediction
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(logits, dim=1)
         
@@ -83,23 +94,29 @@ def analyze_performance():
         print(f"❌ Cannot find model at {MODEL_PATH}")
         return
 
-    # Khởi tạo model architecture (Dummy params để load weights)
-    # Lưu ý: Cần biết dimension của macro từ dữ liệu thật, ở đây giả định lấy từ config hoặc hardcode nếu cần
-    # Để an toàn, ta load 1 mẫu data trước để lấy macro_dim
+    # Lấy dimension macro thực tế để init model cho đúng
     dp = data_prepare(DATA_PATH)
     dummy_train, _, _ = dp.prepare_data("TSLA") 
-    macro_dim = dummy_train["s_m"].shape[-1] if dummy_train else 6 # Fallback
+    if dummy_train:
+        macro_dim = dummy_train["s_m"].shape[-1]
+    else:
+        macro_dim = 6 # Fallback
     
+    print(f"🔧 Model Config: Dim={TrainConfig.dim}, Heads={TrainConfig.num_head}, Macro={macro_dim}")
+
+    # Khởi tạo model architecture
     model = StockMovementModel(
         price_dim=1,
         macro_dim=macro_dim,
         news_dim=TrainConfig.news_embed_dim,
-        dim=TrainConfig.dim,
+        dim=TrainConfig.dim,                 # Phải khớp với lúc train (64)
         input_dim=TrainConfig.window_size,
         output_dim=TrainConfig.output_dim,
-        num_head=TrainConfig.num_head,
-        dropout=0.0, # Dropout không quan trọng khi eval
-        device=DEVICE
+        num_head=TrainConfig.num_head,       # Phải khớp với lúc train (2)
+        device=DEVICE,
+        dropout=0.0,                         # Eval mode không cần dropout
+        class_weights=None,                  # Eval không cần tính loss
+        use_focal_loss=False                 # Eval không cần Focal
     ).to(DEVICE)
     
     try:
@@ -107,11 +124,11 @@ def analyze_performance():
         print("✅ Weights loaded successfully!")
     except Exception as e:
         print(f"❌ Error loading weights: {e}")
+        print("💡 Hint: Kiểm tra xem Config (Dim/Heads) có khớp với file model đã lưu không?")
         return
 
     # 2. Load Data
     print_header("2. LOADING DATA")
-    # List các mã bạn đã train thành công
     target_tickers = ["TSLA", "AMZN", "MSFT", "NFLX"] 
     datasets = load_data_per_ticker(target_tickers)
     
@@ -129,13 +146,11 @@ def analyze_performance():
     print("-" * 110)
 
     for ticker, data in datasets.items():
-        preds, labels, probs = run_forward_pass_manually(model, data)
+        preds, labels, probs = run_prediction(model, data)
         
         all_preds.extend(preds)
         all_labels.extend(labels)
         
-        # Calculate Stats per Ticker
-        from sklearn.metrics import accuracy_score, matthews_corrcoef
         acc = accuracy_score(labels, preds)
         mcc = matthews_corrcoef(labels, preds)
         
@@ -175,6 +190,9 @@ def analyze_performance():
     print(f"Act 0   {cm[0][0]:<7} {cm[0][1]:<7} {cm[0][2]:<7}")
     print(f"Act 1   {cm[1][0]:<7} {cm[1][1]:<7} {cm[1][2]:<7}")
     print(f"Act 2   {cm[2][0]:<7} {cm[2][1]:<7} {cm[2][2]:<7}")
+    
+    print("\n📋 Classification Report:")
+    print(classification_report(all_labels, all_preds, target_names=['DOWN', 'FLAT', 'UP'], zero_division=0))
 
 if __name__ == "__main__":
     analyze_performance()

@@ -71,8 +71,8 @@ class TrainConfig:
 
     # data
     train_ratio = 0.70  # 70% để học
-    valid_ratio = 0.10  # 15% để tinh chỉnh (chọn best model)
-    train_batch_size = 64
+    valid_ratio = 0.15  # 15% để tinh chỉnh (chọn best model)
+    batch_size = 1024
 
     # Window Size (T): Số ngày quá khứ dùng để dự báo.
     window_size = 20
@@ -91,3 +91,4 @@ class TrainConfig:
     # learning_rate = 1e-4
     learning_rate = 1e-4
     weight_decay = 1e-5
+    drop_out = 0.2
