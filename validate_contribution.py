@@ -2,165 +2,204 @@ import torch
 import numpy as np
 import os
 import pandas as pd
-from sklearn.metrics import accuracy_score, matthews_corrcoef, classification_report
-from torch.utils.data import DataLoader, Dataset
+import copy
+from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score, matthews_corrcoef
 
 # Import modules từ dự án
 from src.model import StockMovementModel
-from src.data_loader import data_prepare
-from configs.config import TrainConfig, GlobalConfig
-from main import merge_datasets, StockDataset, set_seed, compute_class_weights
+from src.data_loader import data_prepare, StockDataset
+from configs.config import TrainConfig
+from main import merge_datasets, set_seed, compute_class_weights, evaluate
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = os.path.join("output", "best_model.pt") # Đường dẫn model tốt nhất
 DATA_PATH = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl"
 TARGET_TICKERS = ["TSLA", "AMZN", "MSFT", "NFLX"]
+ABLATION_EPOCHS = 30  # Số epoch train cho mỗi case (có thể thấp hơn main train để nhanh)
 
-def run_ablation_test():
-    print("="*60)
-    print("🧪 MODULE CONTRIBUTION ANALYSIS (ABLATION STUDY)")
-    print("="*60)
+def train_ablation_model(model, train_loader, valid_data, epochs):
+    """Hàm train rút gọn cho ablation study"""
+    optimizer = torch.optim.Adam(model.parameters(), lr=TrainConfig.learning_rate, weight_decay=1e-4)
+    best_mcc = -1.0
+    best_state = None
     
-    # 1. LOAD DATA (TEST SET)
-    print("\n📥 Loading TEST Data...")
+    for epoch in range(epochs):
+        model.train()
+        for batch in train_loader:
+            optimizer.zero_grad()
+            # Lưu ý: batch vẫn chứa đủ data, nhưng model sẽ chỉ dùng phần nó cần
+            # (Logic xử lý nằm ở cách gọi model forward bên dưới)
+            loss = model(
+                batch["s_o"].to(DEVICE), batch["s_h"].to(DEVICE),
+                batch["s_c"].to(DEVICE), batch["s_m"].to(DEVICE),
+                batch["s_n"].to(DEVICE), batch["label"].to(DEVICE),
+                mode="train"
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+        # Validate nhanh
+        if (epoch + 1) % 5 == 0:
+            val_acc, val_mcc = evaluate(model, valid_data)
+            if val_mcc > best_mcc:
+                best_mcc = val_mcc
+                best_state = copy.deepcopy(model.state_dict())
+                
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+def run_scientific_ablation():
+    print("="*60)
+    print("🧪 SCIENTIFIC ABLATION STUDY (RETRAINING METHOD)")
+    print("="*60)
+    set_seed(42)
+
+    # 1. PREPARE DATA (Chung cho tất cả các case)
+    print("\n📥 Loading Data...")
     dp = data_prepare(DATA_PATH)
-    list_test = []
+    list_train, list_valid, list_test = [], [], []
     
-    # Load 1 sample để lấy dimension config
     sample_dim_check = None
-    
     for ticker in TARGET_TICKERS:
         try:
-            _, _, te = dp.prepare_data(ticker)
-            if te and len(te.get("label", [])) > 0:
+            tr, val, te = dp.prepare_data(ticker)
+            if tr and len(tr.get("label", [])) > 0:
+                list_train.append(tr)
+                list_valid.append(val)
                 list_test.append(te)
-                if sample_dim_check is None: sample_dim_check = te
+                if sample_dim_check is None: sample_dim_check = tr
         except: pass
-        
-    if not list_test:
-        print("❌ Error: No test data found.")
-        return
 
-    final_test = merge_datasets(list_test, shuffle=False)
-    print(f"✅ Total Test Samples: {len(final_test['label'])}")
+    final_train = merge_datasets(list_train, shuffle=True)
+    final_valid = merge_datasets(list_valid, shuffle=False)
+    final_test  = merge_datasets(list_test,  shuffle=False)
     
-    # Lấy Dimension thực tế từ dữ liệu
-    s_m_dim = sample_dim_check["s_m"].shape[-1]
+    # DataLoader
+    train_dataset = StockDataset(final_train)
+    train_loader = DataLoader(train_dataset, batch_size=TrainConfig.batch_size, shuffle=True)
     
-    # 2. LOAD TRAINED MODEL
-    print(f"\n🤖 Loading Model from: {MODEL_PATH}")
-    if not os.path.exists(MODEL_PATH):
-        print("❌ Model file not found! Please train a model first.")
-        return
-
-    # Khởi tạo model y hệt cấu hình training (Weights không quan trọng vì ta load state_dict)
-    # Lưu ý: Cần dummy weights để init Focal Loss, ta tạo tạm
-    dummy_weights = torch.tensor([1.0, 1.0, 1.0]) 
+    # Lấy dimension thực tế
+    real_macro_dim = sample_dim_check["s_m"].shape[-1]
+    real_news_dim = TrainConfig.news_embed_dim
     
-    model = StockMovementModel(
-        price_dim=1, macro_dim=s_m_dim, news_dim=TrainConfig.news_embed_dim,
-        dim=TrainConfig.dim, input_dim=TrainConfig.window_size,
-        output_dim=TrainConfig.output_dim, num_head=TrainConfig.num_head,
-        dropout=0.0, # Tắt dropout khi test
-        class_weights=dummy_weights, use_focal_loss=True, device=DEVICE
-    ).to(DEVICE)
-    
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-    model.eval()
-    print("✅ Model Loaded Successfully.")
-
-    # 3. DEFINE ABLATION EXPERIMENTS
-    # Danh sách các kịch bản test
-    experiments = [
-        {"name": "BASELINE (Full Info)", "mask_macro": False, "mask_news": False},
-        {"name": "NO MACRO (Price+News)", "mask_macro": True,  "mask_news": False},
-        {"name": "NO NEWS  (Price+Macro)", "mask_macro": False, "mask_news": True},
-        {"name": "PRICE ONLY",            "mask_macro": True,  "mask_news": True},
+    # 2. DEFINE SCENARIOS
+    # Mỗi scenario định nghĩa dimension input sẽ được truyền vào model
+    # Nếu dim = 0 nghĩa là tắt module đó
+    scenarios = [
+        {
+            "name": "FULL MODEL (Price + Macro + News)",
+            "use_macro": True, "use_news": True,
+            "macro_dim": real_macro_dim, "news_dim": real_news_dim
+        },
+        {
+            "name": "NO NEWS (Price + Macro)",
+            "use_macro": True, "use_news": False,
+            "macro_dim": real_macro_dim, "news_dim": 0 # Tắt News
+        },
+        {
+            "name": "NO MACRO (Price + News)",
+            "use_macro": False, "use_news": True,
+            "macro_dim": 0, "news_dim": real_news_dim # Tắt Macro
+        },
+        {
+            "name": "PRICE ONLY",
+            "use_macro": False, "use_news": False,
+            "macro_dim": 0, "news_dim": 0 # Tắt cả hai
+        }
     ]
     
     results = []
 
-    # 4. RUN EXPERIMENTS
-    print("\n🚀 Running Inference Tests...")
-    
-    for exp in experiments:
-        exp_name = exp["name"]
-        print(f"   Running: {exp_name}...", end="")
+    # 3. RUN EXPERIMENTS
+    for sc in scenarios:
+        print(f"\n🚀 Running Scenario: {sc['name']}")
+        print(f"   Configs: Macro_Dim={sc['macro_dim']}, News_Dim={sc['news_dim']}")
         
-        acc, mcc, report = evaluate_with_masking(
-            model, final_test, 
-            mask_macro=exp["mask_macro"], 
-            mask_news=exp["mask_news"]
-        )
+        # A. Khởi tạo Model Mới
+        # Lưu ý: Cần sửa class StockMovementModel một chút để handle input dim = 0 (nếu chưa support)
+        # Tuy nhiên, ta có thể trick bằng cách truyền dummy tensor 0 vào forward nếu dim > 0
+        # Cách sạch nhất là Model tự handle.
+        # Ở đây giả định Model có thể nhận dim=0 và layer linear(0, dim) sẽ không lỗi hoặc ta handle ở forward.
+        
+        # Để an toàn, ta vẫn khởi tạo model với dimension thật, 
+        # nhưng TRONG VÒNG LẶP TRAIN/EVAL, ta sẽ zero-out input của module bị tắt.
+        # Điều này mô phỏng việc model không nhìn thấy dữ liệu đó ngay từ đầu quá trình học.
+        
+        model = StockMovementModel(
+            price_dim=1,
+            macro_dim=real_macro_dim, # Khởi tạo full để tránh lỗi kiến trúc
+            news_dim=real_news_dim,   # Khởi tạo full
+            dim=TrainConfig.dim,
+            input_dim=TrainConfig.window_size,
+            output_dim=TrainConfig.output_dim,
+            num_head=TrainConfig.num_head,
+            dropout=0.1,
+            class_weights=None, # No weights như main mới nhất
+            use_focal_loss=True,
+            device=DEVICE
+        ).to(DEVICE)
+        
+        # B. Wrapper để Masking ngay từ lúc Train (Đây là điểm khác biệt với code cũ)
+        # Ta tạo một hàm forward wrapper hoặc class wrapper
+        class AblationWrapper(torch.nn.Module):
+            def __init__(self, core_model, use_macro, use_news):
+                super().__init__()
+                self.core = core_model
+                self.use_macro = use_macro
+                self.use_news = use_news
+                
+            def forward(self, s_o, s_h, s_c, s_m, s_n, label=None, mode="train"):
+                # Cưỡng bức Input về 0 NGAY KHI TRAIN nếu bị tắt
+                if not self.use_macro:
+                    s_m = torch.zeros_like(s_m)
+                if not self.use_news:
+                    s_n = torch.zeros_like(s_n)
+                
+                return self.core(s_o, s_h, s_c, s_m, s_n, label, mode)
+
+        wrapped_model = AblationWrapper(model, sc['use_macro'], sc['use_news'])
+        
+        # C. Train from Scratch
+        print("   Training...")
+        trained_model = train_ablation_model(wrapped_model, train_loader, final_valid, epochs=ABLATION_EPOCHS)
+        
+        # D. Evaluate
+        print("   Evaluating...")
+        test_acc, test_mcc = evaluate(trained_model, final_test)
         
         results.append({
-            "Scenario": exp_name,
-            "ACC": acc,
-            "MCC": mcc,
-            "Diff MCC": 0.0 # Sẽ tính sau
+            "Scenario": sc['name'],
+            "ACC": test_acc,
+            "MCC": test_mcc
         })
-        print(f" Done. (MCC: {mcc:.4f})")
+        print(f"   Result -> ACC: {test_acc:.4f} | MCC: {test_mcc:.4f}")
 
-    # 5. ANALYZE RESULTS
+    # 4. REPORT
     print("\n" + "="*60)
-    print("📊 CONTRIBUTION REPORT")
+    print("📊 SCIENTIFIC ABLATION REPORT")
     print("="*60)
-    
-    # Lấy baseline MCC
-    baseline_mcc = results[0]["MCC"]
-    
-    # Tạo DataFrame để hiển thị đẹp
     df_res = pd.DataFrame(results)
-    df_res["Diff MCC"] = df_res["MCC"] - baseline_mcc
-    df_res["Impact"] = df_res["Diff MCC"].apply(lambda x: "🔻 HURT" if x < -0.01 else ("✅ HELP" if x > 0.01 else "⚪ NEUTRAL"))
+    
+    # Tính Delta so với Baseline (Full Model)
+    baseline_mcc = df_res.iloc[0]["MCC"]
+    df_res["Delta MCC"] = df_res["MCC"] - baseline_mcc
     
     print(df_res.to_string(index=False, formatters={
-        "ACC": "{:.4f}".format,
+        "ACC": "{:.4f}".format, 
         "MCC": "{:.4f}".format,
-        "Diff MCC": "{:+.4f}".format
+        "Delta MCC": "{:+.4f}".format
     }))
     
-    print("\n📝 INTERPRETATION:")
-    print("   - Nếu 'Diff MCC' ÂM LỚN (vd: -0.05): Module đó QUAN TRỌNG (bỏ đi làm model ngu đi).")
-    print("   - Nếu 'Diff MCC' GẦN 0 (vd: -0.00): Module đó VÔ DỤNG (model không thèm dùng nó).")
-    print("   - Nếu 'Diff MCC' DƯƠNG (vd: +0.02): Module đó GÂY NHIỄU (bỏ đi model lại chạy tốt hơn).")
-
-def evaluate_with_masking(model, data_dict, mask_macro=False, mask_news=False):
-    """
-    Hàm Evaluate có khả năng 'tắt' (mask) các nguồn dữ liệu bằng cách đưa về 0.
-    """
-    s_o = data_dict["s_o"].to(DEVICE)
-    s_h = data_dict["s_h"].to(DEVICE)
-    s_c = data_dict["s_c"].to(device=DEVICE)
-    
-    # Xử lý Masking cho Macro
-    if mask_macro:
-        # Tạo tensor 0 cùng kích thước
-        s_m = torch.zeros_like(data_dict["s_m"]).to(DEVICE)
+    print("\n📝 CONCLUSION:")
+    best_row = df_res.loc[df_res['MCC'].idxmax()]
+    print(f"   🏆 Best Configuration: {best_row['Scenario']}")
+    if best_row['Scenario'] != scenarios[0]['name']:
+        print(f"   ⚠️  Warning: Full Model is NOT the best. Consider removing noisy modules.")
     else:
-        s_m = data_dict["s_m"].to(DEVICE)
-        
-    # Xử lý Masking cho News
-    if mask_news:
-        s_n = torch.zeros_like(data_dict["s_n"]).to(DEVICE)
-    else:
-        s_n = data_dict["s_n"].to(DEVICE)
-        
-    label = data_dict["label"].to(DEVICE)
-    
-    with torch.no_grad():
-        # Forward pass
-        acc, mcc = model(s_o, s_h, s_c, s_m, s_n, label, mode="test")
-        
-        # Lấy thêm classification report (optional)
-        # logits = model(s_o, s_h, s_c, s_m, s_n, mode="inference")
-        # preds = torch.argmax(logits, dim=1)
-        # report = classification_report(label.cpu(), preds.cpu(), output_dict=True, zero_division=0)
-        
-    return acc, mcc, None
+        print(f"   ✅ Full Model is the best. Synergy confirmed.")
 
 if __name__ == "__main__":
-    # Đảm bảo seed để tái lập kết quả
-    set_seed(42) 
-    run_ablation_test()
+    run_scientific_ablation()

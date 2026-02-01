@@ -13,7 +13,6 @@ from configs.config import TrainConfig
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = os.path.join("output", "best_model.pt")
-# Đảm bảo đường dẫn này trỏ đúng file pkl mới nhất
 DATA_PATH = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl" 
 
 def print_header(title):
@@ -24,7 +23,6 @@ def print_header(title):
 def load_data_per_ticker(tickers):
     """
     Load dữ liệu Test riêng biệt cho từng mã để phân tích behavior.
-    Sử dụng logic Rolling Z-Score mới nhất từ data_loader.
     """
     dp = data_prepare(DATA_PATH)
     ticker_datasets = {}
@@ -32,12 +30,10 @@ def load_data_per_ticker(tickers):
     print(f"📥 Loading TEST data for: {tickers}")
     for t in tickers:
         try:
-            # prepare_data trả về: train, valid, test
-            # Ta chỉ cần test (index 2)
+            # prepare_data trả về: train, valid, test (index 2)
             _, _, test_data = dp.prepare_data(
                 stock_name=t,
                 window_size=TrainConfig.window_size,
-                # Các tham số khác sẽ lấy default từ Config
             )
             
             if test_data and len(test_data.get("label", [])) > 0:
@@ -53,7 +49,6 @@ def load_data_per_ticker(tickers):
 def run_prediction(model, data_dict):
     """
     Chạy forward pass để lấy Logits và Predictions.
-    Logic được cập nhật để gọi thẳng model, tránh hard-code sai lệch.
     """
     model.eval()
     with torch.no_grad():
@@ -63,22 +58,15 @@ def run_prediction(model, data_dict):
         s_m = data_dict["s_m"].to(DEVICE)
         s_n = data_dict["s_n"].to(DEVICE)
         
-        # Gọi Encoder + Fusion + Predictor
-        # Lưu ý: Ta cần sửa nhẹ model.py để hàm forward trả về logits khi không có label
-        # Tuy nhiên, để không phải sửa model.py, ta tái sử dụng logic tính toán thủ công
-        # nhưng đảm bảo nó khớp 100% với model.py hiện tại.
-        
         # 1. Encoder
         v_m, v_i, v_n = model.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
         
-        # 2. Fusion
+        # 2. Fusion (Lưu ý: Fusion mới có thể không dùng residual cho gating)
         fused_news = model.fusion_news(primary=v_i, aux=v_n)
         fused_macro = model.fusion_macro(primary=v_i, aux=v_m)
-        
-        # Logic trung bình cộng (cần khớp với main model)
         v_fused_total = (fused_news + fused_macro) / 2.0
         
-        # 3. Predictor
+        # 3. Predictor (Attention Pooling)
         logits = model.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
         
         # Probability & Prediction
@@ -96,6 +84,7 @@ def analyze_performance():
 
     # Lấy dimension macro thực tế để init model cho đúng
     dp = data_prepare(DATA_PATH)
+    # Lấy thử 1 mã để check dimension
     dummy_train, _, _ = dp.prepare_data("TSLA") 
     if dummy_train:
         macro_dim = dummy_train["s_m"].shape[-1]
@@ -109,10 +98,10 @@ def analyze_performance():
         price_dim=1,
         macro_dim=macro_dim,
         news_dim=TrainConfig.news_embed_dim,
-        dim=TrainConfig.dim,                 # Phải khớp với lúc train (64)
+        dim=TrainConfig.dim,                 
         input_dim=TrainConfig.window_size,
         output_dim=TrainConfig.output_dim,
-        num_head=TrainConfig.num_head,       # Phải khớp với lúc train (2)
+        num_head=TrainConfig.num_head,       
         device=DEVICE,
         dropout=0.0,                         # Eval mode không cần dropout
         class_weights=None,                  # Eval không cần tính loss
@@ -124,7 +113,6 @@ def analyze_performance():
         print("✅ Weights loaded successfully!")
     except Exception as e:
         print(f"❌ Error loading weights: {e}")
-        print("💡 Hint: Kiểm tra xem Config (Dim/Heads) có khớp với file model đã lưu không?")
         return
 
     # 2. Load Data
@@ -173,7 +161,16 @@ def analyze_performance():
     unique_pred, counts_pred = np.unique(all_preds, return_counts=True)
     
     print("📉 ACTUAL Labels Distribution (Ground Truth):")
-    print(f"   {dict(zip(unique_act, counts_act))}")
+    act_dist_dict = dict(zip(unique_act, counts_act))
+    print(f"   {act_dist_dict}")
+    
+    # Tính toán tỷ lệ phần trăm
+    total_act = sum(counts_act)
+    if total_act > 0:
+        p0 = act_dist_dict.get(0,0)/total_act*100
+        p1 = act_dist_dict.get(1,0)/total_act*100
+        p2 = act_dist_dict.get(2,0)/total_act*100
+        print(f"   (Down: {p0:.1f}%, Flat: {p1:.1f}%, Up: {p2:.1f}%)")
     
     print("\n🔮 PREDICTED Labels Distribution:")
     print(f"   {dict(zip(unique_pred, counts_pred))}")
@@ -182,7 +179,6 @@ def analyze_performance():
     if len(unique_pred) == 1:
         print("\n⚠️  CRITICAL WARNING: MODE COLLAPSE DETECTED!")
         print(f"   Mô hình chỉ dự đoán duy nhất lớp {unique_pred[0]} cho toàn bộ dữ liệu.")
-        print("   -> Đây là lý do MCC = 0.0000")
     
     print("\n📊 Confusion Matrix:")
     cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2])
