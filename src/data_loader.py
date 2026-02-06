@@ -2,16 +2,36 @@
 import pandas as pd
 import numpy as np
 import torch
-from configs.config import TrainConfig  
+from configs.config import TrainConfig
+import pickle
+import os
+from datetime import datetime
+
+# Cố gắng import PyG Data
+try:
+    from torch_geometric.data import Data
+    HAS_PYG = True
+except ImportError:
+    HAS_PYG = False
+    print("⚠️ Warning: torch_geometric not found. KG features will be disabled.")
 
 class data_prepare:
-    def __init__(self, data_path) -> None:
+    def __init__(self, data_path, kg_data_path=None) -> None:
         self.data_path = data_path
+        self.kg_data_path = kg_data_path
+        
+        # Load KG data if provided
+        self.kg_data = None
+        if kg_data_path and os.path.exists(kg_data_path) and HAS_PYG:
+            print(f"📦 Loading KG data from {kg_data_path}...")
+            try:
+                with open(kg_data_path, 'rb') as f:
+                    self.kg_data = pickle.load(f)
+                print(f"   ✓ Loaded KG graphs for {len(self.kg_data)} dates")
+            except Exception as e:
+                print(f"   ❌ Error loading KG data: {e}")
+                self.kg_data = None
 
-    # ======================================================
-    # LABEL: RETURN Calculation
-    # r_t = close_t / close_{t-1} - 1
-    # ======================================================
     def create_return(self, price_df):
         df = price_df.copy()
         df["return"] = df["close"] / df["close"].shift(1) - 1
@@ -27,6 +47,82 @@ class data_prepare:
         for i in range(len(data) - window_size + 1):
             X.append(data[i:i + window_size])
         return np.array(X)
+    
+    def _convert_dict_to_data(self, graph_dict):
+        """
+        Helper: Convert Graph Dict (from pickle) to PyG Data Object.
+        Model requires Data object to access .x and .edge_index attributes.
+        """
+        if not HAS_PYG: return None
+        
+        # Nếu đã là Data object thì trả về luôn
+        if isinstance(graph_dict, Data):
+            return graph_dict
+            
+        # Nếu là Dict, convert sang Data
+        if isinstance(graph_dict, dict):
+            if 'x' not in graph_dict or len(graph_dict['x']) == 0:
+                return self._get_empty_graph()
+            return Data(x=graph_dict['x'], edge_index=graph_dict['edge_index'])
+            
+        return self._get_empty_graph()
+
+    def _get_empty_graph(self):
+        """
+        Helper: Create a valid empty graph to prevent model crash.
+        """
+        if not HAS_PYG: return None
+        # Dim = 772 (Voyage 768 + 4 types) or from config
+        dim = getattr(TrainConfig, 'kg_input_dim', 772)
+        
+        # Create 1 dummy node with zeros
+        x = torch.zeros((1, dim), dtype=torch.float32)
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        return Data(x=x, edge_index=edge_index)
+
+    def _get_kg_sequence(self, dates, ticker, window_size):
+        """
+        Extract KG graph sequence for given dates.
+        Returns: List of Lists of PyG Data objects (length = N windows)
+        """
+        if not self.kg_data:
+            return None
+        
+        all_sequences = []
+        
+        # Iterate to create windows (Logic matches make_window)
+        for i in range(len(dates) - window_size + 1):
+            window_dates = dates[i : i + window_size]
+            
+            sequence = []
+            for date in window_dates:
+                # 1. Normalize Date Key
+                date_key = date
+                # Try direct lookup first
+                if date_key not in self.kg_data:
+                    # Try converting to python datetime if it's Timestamp
+                    if isinstance(date, pd.Timestamp):
+                        date_key = date.to_pydatetime()
+                    elif isinstance(date, str):
+                        try:
+                            date_key = datetime.fromisoformat(date)
+                        except: pass
+                
+                # 2. Fetch Graph
+                graph = None
+                if date_key in self.kg_data and ticker in self.kg_data[date_key]:
+                    raw_graph = self.kg_data[date_key][ticker]
+                    graph = self._convert_dict_to_data(raw_graph)
+                
+                # 3. Fallback to Empty
+                if graph is None:
+                    graph = self._get_empty_graph()
+                
+                sequence.append(graph)
+            
+            all_sequences.append(sequence)
+        
+        return all_sequences
 
     def prepare_data(
         self,
@@ -54,7 +150,7 @@ class data_prepare:
             price = content["price"][stock_name]
             macro = content["macro"]
 
-            # Lấy embedding tin tức
+            # News embedding
             news_section = content.get("news_embedding", {})
             raw_vec = news_section.get(stock_name)
 
@@ -96,7 +192,7 @@ class data_prepare:
         news_df = news_df.apply(pd.to_numeric, errors="coerce")
         news_df = news_df.fillna(0.0)
 
-        # Tạo Return DataFrame (để tính nhãn)
+        # Create Return DataFrame
         return_df = self.create_return(price_df)
 
         # Align Step 1
@@ -104,7 +200,7 @@ class data_prepare:
         macro_df = macro_df.loc[return_df.index]
         news_df  = news_df.loc[return_df.index]
 
-        # Log-Return cho Input Price
+        # Log-Return for Input Price
         price_df = np.log(price_df / price_df.shift(1))
         price_df.dropna(inplace=True)
 
@@ -120,91 +216,102 @@ class data_prepare:
         # ==========================
         # 3. WINDOWING
         # ==========================
-        price_np  = price_df.values           
-        macro_np  = macro_df.values           
-        news_np   = news_df.values            
-        return_np = return_df.values          
+        price_np  = price_df.values
+        macro_np  = macro_df.values
+        news_np   = news_df.values
+        return_np = return_df.values
 
         price_win = self.make_window(price_np, window_size)
         macro_win = self.make_window(macro_np, window_size)
         news_win  = self.make_window(news_np, window_size)
 
-        # Label raw (shifted by future_days)
-        # Cắt đi phần đầu (window size) và dịch tương lai
+        # Label slicing
         label_raw = return_np[window_size - 1 + future_days:]
-
-        # Cắt input tương ứng để khớp độ dài với label
+        
+        # Input slicing (Align with labels)
         price_win = price_win[:-future_days]
         macro_win = macro_win[:-future_days]
         news_win  = news_win[:-future_days]
 
-        # ==============================================================================
-        # [NEW STRATEGY] ROLLING QUANTILE LABELING (Dynamic & No Look-Ahead)
-        # ==============================================================================
-        
-        # 1. Prepare Full Series
+        # ==========================
+        # NEW: KG WINDOWING
+        # ==========================
+        kg_sequences = None
+        if TrainConfig.use_kg and self.kg_data and HAS_PYG:
+            print(f"   🕸️  Preparing KG sequences for {stock_name}...")
+            # Use index (Dates) from price_df which is already aligned
+            dates = list(price_df.index)
+            
+            # Generate sequences
+            kg_sequences = self._get_kg_sequence(dates, stock_name, window_size)
+            
+            if kg_sequences:
+                # Align with other data (remove future days matches price_win slicing)
+                kg_sequences = kg_sequences[:-future_days]
+                print(f"   ✓ Prepared {len(kg_sequences)} KG sequences")
+            else:
+                print("   ⚠️  Failed to generate KG sequences.")
+
+        # ==========================
+        # 4. LABELING (Rolling Quantile)
+        # ==========================
         full_returns_series = pd.Series(return_np.flatten())
         rolling_window = 20
         
-        # 2. Tính Quantile động (33% và 66%) trên cửa sổ quá khứ
-        # [CRITICAL FIX]: .shift(1) để loại bỏ Look-Ahead Bias. 
-        # Giá trị ngưỡng tại ngày t được tính từ [t-20 ... t-1], KHÔNG bao gồm t.
+        # Calculate thresholds (Shift 1 to avoid look-ahead)
         roll_low  = full_returns_series.rolling(window=rolling_window).quantile(0.33).shift(1)
         roll_high = full_returns_series.rolling(window=rolling_window).quantile(0.66).shift(1)
         
-        # 3. Vectorized Labeling
-        # Mặc định là FLAT (1)
         labels_temp = np.full(len(full_returns_series), 1, dtype=int)
         
-        # Điều kiện:
-        # DOWN (0): Return thấp hơn ngưỡng 33% quá khứ
         is_down = full_returns_series < roll_low
-        # UP (2): Return cao hơn ngưỡng 66% quá khứ
         is_up   = full_returns_series > roll_high
-        
-        # [NOISE FILTER]: Nếu biến động tuyệt đối < 0.1% (0.001), ép về FLAT
-        # Tránh việc ép model học nhiễu trong thị trường đi ngang biên độ cực hẹp
         is_noise = full_returns_series.abs() < 0.001
         
-        # Gán nhãn (Thứ tự quan trọng: Noise filter ghi đè tất cả)
         labels_temp[is_down] = 0
         labels_temp[is_up]   = 2
-        labels_temp[is_noise] = 1 # Force Flat
-        
-        # Xử lý NaN đầu chuỗi (do rolling window) -> Mặc định Flat
+        labels_temp[is_noise] = 1
         labels_temp[np.isnan(roll_low)] = 1
         
-        # 4. Slicing Label để khớp với Window Input
+        # Align labels
         start_idx = window_size - 1 + future_days
         if start_idx < len(labels_temp):
             label_all = labels_temp[start_idx:]
         else:
             label_all = np.array([])
 
-        # [LOGGING] Kiểm tra phân phối sau khi đổi chiến lược
+        # Check lengths consistency
+        min_len = min(len(price_win), len(label_all))
+        if kg_sequences:
+            min_len = min(min_len, len(kg_sequences))
+            
+        # Truncate to min_len to ensure synchronization
+        price_win = price_win[:min_len]
+        macro_win = macro_win[:min_len]
+        news_win  = news_win[:min_len]
+        label_all = label_all[:min_len]
+        if kg_sequences:
+            kg_sequences = kg_sequences[:min_len]
+
+        # Label Distribution Logging
         unique, counts = np.unique(label_all, return_counts=True)
         dist = dict(zip(unique, counts))
         total_lbl = sum(counts)
-        
-        print(f" ⚖️  Label Distribution (Rolling Quantile 33/66): {dist}")
+        print(f" ⚖️  Label Distribution: {dist}")
         if total_lbl > 0:
             p0 = dist.get(0,0)/total_lbl
             p1 = dist.get(1,0)/total_lbl
             p2 = dist.get(2,0)/total_lbl
             print(f"      Down: {p0:.2%}, Flat: {p1:.2%}, Up: {p2:.2%}")
-            
-            # Cảnh báo nếu vẫn quá lệch (dù Quantile thường sẽ cân bằng)
-            if p1 > 0.5:
-                print("      ⚠️ Warning: FLAT class is still dominant (>50%). Consider reducing noise threshold.")
 
         # ==========================
-        # 4. SPLIT DATASETS
+        # 5. SPLIT DATASETS
         # ==========================
         total_len = len(price_win)
         idx_train = int(total_len * train_ratio)
         idx_valid = int(total_len * (train_ratio + valid_ratio))
 
-        # Normalization (Fit on Train, Apply on All)
+        # Normalization
         macro_mean = macro_win[:idx_train].mean(axis=(0, 1), keepdims=True)
         macro_std  = macro_win[:idx_train].std(axis=(0, 1), keepdims=True) + 1e-6
         
@@ -215,8 +322,10 @@ class data_prepare:
         news_win  = (news_win - news_mean) / news_std
 
         def create_dataset(start, end):
-            if start >= end: return {}
-            return {
+            if start >= end:
+                return {}
+            
+            dataset = {
                 "s_o": torch.tensor(price_win[start:end, :, 0:1], dtype=torch.float32),
                 "s_h": torch.tensor(price_win[start:end, :, 1:2], dtype=torch.float32),
                 "s_c": torch.tensor(price_win[start:end, :, 2:3], dtype=torch.float32),
@@ -224,6 +333,12 @@ class data_prepare:
                 "s_n": torch.tensor(news_win[start:end], dtype=torch.float32),
                 "label": torch.tensor(label_all[start:end], dtype=torch.long),
             }
+            
+            # Add KG sequences if available
+            if kg_sequences:
+                dataset["s_kg"] = kg_sequences[start:end]
+            
+            return dataset
 
         train_data = create_dataset(0, idx_train)
         valid_data = create_dataset(idx_train, idx_valid)

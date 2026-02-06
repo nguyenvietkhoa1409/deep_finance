@@ -8,12 +8,14 @@ from collections import Counter
 # Import project modules
 from src.model import StockMovementModel
 from src.data_loader import data_prepare
-from configs.config import TrainConfig
+from configs.config import TrainConfig, GlobalConfig
 
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = os.path.join("output", "best_model.pt")
-DATA_PATH = r"D:\DeepFinance\data\processed\unified_dataset_test.pkl" 
+# Đảm bảo đường dẫn này trỏ đúng file pkl mới nhất
+DATA_PATH = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
+KG_PATH = GlobalConfig.KG_PROCESSED_PATH if getattr(TrainConfig, "use_kg", False) else None
 
 def print_header(title):
     print(f"\n{'='*60}")
@@ -24,10 +26,14 @@ def load_data_per_ticker(tickers):
     """
     Load dữ liệu Test riêng biệt cho từng mã để phân tích behavior.
     """
-    dp = data_prepare(DATA_PATH)
+    # Khởi tạo data_prepare với KG path
+    dp = data_prepare(DATA_PATH, kg_data_path=KG_PATH)
     ticker_datasets = {}
     
-    print(f"📥 Loading TEST data for: {tickers}")
+    print(f"📥 Loading TEST data from: {DATA_PATH}")
+    if KG_PATH:
+        print(f"🕸️  Loading KG data from: {KG_PATH}")
+        
     for t in tickers:
         try:
             # prepare_data trả về: train, valid, test (index 2)
@@ -40,7 +46,7 @@ def load_data_per_ticker(tickers):
                 ticker_datasets[t] = test_data
                 print(f"   ✅ {t}: {len(test_data['label'])} samples")
             else:
-                print(f"   ⚠️ {t}: No data or empty test set")
+                print(f"   ⚠️  {t}: No data or empty test set")
         except Exception as e:
             print(f"   ❌ {t}: Error {e}")
             
@@ -51,27 +57,26 @@ def run_prediction(model, data_dict):
     Chạy forward pass để lấy Logits và Predictions.
     """
     model.eval()
+    
+    # Prepare KG data
+    s_kg = data_dict.get("s_kg") # List of lists
+    
     with torch.no_grad():
-        s_o = data_dict["s_o"].to(DEVICE)
-        s_h = data_dict["s_h"].to(DEVICE)
-        s_c = data_dict["s_c"].to(DEVICE)
-        s_m = data_dict["s_m"].to(DEVICE)
-        s_n = data_dict["s_n"].to(DEVICE)
+        # [CRITICAL FIX] Use keyword arguments matching updated model signature
+        acc, mcc, preds, logits = model(
+            s_o=data_dict["s_o"].to(DEVICE),
+            s_h=data_dict["s_h"].to(DEVICE),
+            s_c=data_dict["s_c"].to(DEVICE),
+            s_m=data_dict["s_m"].to(DEVICE),
+            s_n=data_dict["s_n"].to(DEVICE),
+            s_kg=s_kg, # Pass KG data
+            label=data_dict["label"].to(DEVICE),
+            mode="test",
+            return_logits=True # Request logits return
+        )
         
-        # 1. Encoder
-        v_m, v_i, v_n = model.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
-        
-        # 2. Fusion (Lưu ý: Fusion mới có thể không dùng residual cho gating)
-        fused_news = model.fusion_news(primary=v_i, aux=v_n)
-        fused_macro = model.fusion_macro(primary=v_i, aux=v_m)
-        v_fused_total = (fused_news + fused_macro) / 2.0
-        
-        # 3. Predictor (Attention Pooling)
-        logits = model.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
-        
-        # Probability & Prediction
+        # Calculate probabilities
         probs = torch.softmax(logits, dim=1)
-        preds = torch.argmax(logits, dim=1)
         
     return preds.cpu().numpy(), data_dict["label"].numpy(), probs.cpu().numpy()
 
@@ -83,7 +88,7 @@ def analyze_performance():
         return
 
     # Lấy dimension macro thực tế để init model cho đúng
-    dp = data_prepare(DATA_PATH)
+    dp = data_prepare(DATA_PATH, kg_data_path=KG_PATH)
     # Lấy thử 1 mã để check dimension
     dummy_train, _, _ = dp.prepare_data("TSLA") 
     if dummy_train:
@@ -92,6 +97,7 @@ def analyze_performance():
         macro_dim = 6 # Fallback
     
     print(f"🔧 Model Config: Dim={TrainConfig.dim}, Heads={TrainConfig.num_head}, Macro={macro_dim}")
+    print(f"🕸️  KG Enabled: {getattr(TrainConfig, 'use_kg', False)}")
 
     # Khởi tạo model architecture
     model = StockMovementModel(
@@ -103,9 +109,10 @@ def analyze_performance():
         output_dim=TrainConfig.output_dim,
         num_head=TrainConfig.num_head,       
         device=DEVICE,
-        dropout=0.0,                         # Eval mode không cần dropout
-        class_weights=None,                  # Eval không cần tính loss
-        use_focal_loss=False                 # Eval không cần Focal
+        dropout=0.0,                         
+        class_weights=None,                  
+        use_focal_loss=False,                
+        use_kg=getattr(TrainConfig, "use_kg", False) # NEW
     ).to(DEVICE)
     
     try:
@@ -117,7 +124,7 @@ def analyze_performance():
 
     # 2. Load Data
     print_header("2. LOADING DATA")
-    target_tickers = ["TSLA", "AMZN", "MSFT", "NFLX"] 
+    target_tickers = getattr(GlobalConfig, "TICKERS", ["TSLA", "AMZN", "MSFT", "NFLX"])
     datasets = load_data_per_ticker(target_tickers)
     
     if not datasets:
@@ -181,7 +188,10 @@ def analyze_performance():
         print(f"   Mô hình chỉ dự đoán duy nhất lớp {unique_pred[0]} cho toàn bộ dữ liệu.")
     
     print("\n📊 Confusion Matrix:")
-    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2])
+    # Handle cases where some classes are missing in predictions or labels
+    labels_present = [0, 1, 2]
+    cm = confusion_matrix(all_labels, all_preds, labels=labels_present)
+    
     print(f"      Pred 0  Pred 1  Pred 2")
     print(f"Act 0   {cm[0][0]:<7} {cm[0][1]:<7} {cm[0][2]:<7}")
     print(f"Act 1   {cm[1][0]:<7} {cm[1][1]:<7} {cm[1][2]:<7}")

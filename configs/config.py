@@ -19,7 +19,11 @@ class GlobalConfig:
 
     NEWS_EMBEDDING_OUTPUT_PATH = os.path.join(INTERIM_PATH, 'news_headline_embeddings')
 
-    
+    # ============================================
+    # NEW: Knowledge Graph Paths
+    # ============================================
+    KG_CACHE_DIR = os.path.join(INTERIM_PATH, 'kg_cache')
+    KG_PROCESSED_PATH = os.path.join(PROCESSED_PATH, 'kg_graphs.pkl')
     
     # --- API Keys (Load from env or set here) ---
     ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "YOUR_API_KEY")
@@ -92,3 +96,12 @@ class TrainConfig:
     learning_rate = 1e-4
     weight_decay = 1e-5
     drop_out = 0.1
+    
+    # ============================================
+    # NEW: Knowledge Graph Settings
+    # ============================================
+    use_kg = True  # Enable/disable KG module
+    kg_input_dim = 772  # Node feature dimension
+    kg_hidden_dim = 256  # GCN hidden dimension
+    kg_output_dim = 128  # Must match 'dim' below
+    kg_dropout = 0.1
