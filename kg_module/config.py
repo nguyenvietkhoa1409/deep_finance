@@ -3,6 +3,30 @@ Configuration for Knowledge Graph Module
 """
 
 # ============================================
+# EMBEDDINGS CONFIGURATION
+# ============================================
+# CHANGED: Use full Voyage output dimension
+TICKER_EMBEDDING_DIM = 1024  # Full Voyage-finance-2 output
+RELATION_EMBEDDING_DIM = 1024  # Full Voyage-finance-2 output
+
+# Node feature composition:
+# - Center node: [ticker_embedding (1024,) + padding (4,)] = 1028-dim
+# - Event node: [relation_embedding (1024,) + magnitude + polarity + certainty + decay] = 1028-dim
+NODE_FEATURE_DIM = TICKER_EMBEDDING_DIM + 4  # 1028
+
+# ============================================
+# GCN ENCODER SETTINGS (UPDATED)
+# ============================================
+GCN_INPUT_DIM = NODE_FEATURE_DIM  # 1028 (was 772)
+GCN_HIDDEN_DIM = 512  # Scaled up (was 256)
+GCN_OUTPUT_DIM = 128  # Keep same (must match TrainConfig.dim)
+GCN_DROPOUT = 0.1
+GCN_NUM_LAYERS = 2
+
+
+
+
+# ============================================
 # RELATION TYPES (No clustering needed)
 # ============================================
 RELATION_TYPES = {

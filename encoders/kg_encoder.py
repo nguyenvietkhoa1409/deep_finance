@@ -1,5 +1,5 @@
 """
-Stage 3: Graph Neural Network Encoder
+Stage 3: Graph Neural Network Encoder (FIXED: PyG Data support)
 Simple GCN for encoding knowledge graphs
 """
 
@@ -7,25 +7,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-from typing import Optional
+from torch_geometric.data import Data
+from typing import Optional, Union, List, Dict
 
 
 class SimpleGCN(nn.Module):
     """
     Simple 2-layer GCN encoder for star graphs.
     
-    Architecture:
-        Input (N, 772) → GCN(772→256) → ReLU → Dropout
-                      → GCN(256→128) → ReLU → Dropout
-                      → Global Mean Pool → (128,)
+    FIXED: Support both dict and PyG Data objects
     
-    Memory: ~2GB (vs 12GB+ for R-GAT)
+    Architecture:
+        Input (N, 1028) → GCN(1028→512) → ReLU → Dropout
+                        → GCN(512→128) → ReLU → Dropout
+                        → Global Mean Pool → (128,)
     """
     
     def __init__(
         self,
-        input_dim: int = 772,
-        hidden_dim: int = 256,
+        input_dim: int = 1028,
+        hidden_dim: int = 512,
         output_dim: int = 128,
         dropout: float = 0.1
     ):
@@ -33,8 +34,8 @@ class SimpleGCN(nn.Module):
         Initialize GCN encoder.
         
         Args:
-            input_dim: Node feature dimension (772)
-            hidden_dim: Hidden layer dimension (256)
+            input_dim: Node feature dimension (1028 for full Voyage)
+            hidden_dim: Hidden layer dimension (512)
             output_dim: Output embedding dimension (128)
             dropout: Dropout rate
         """
@@ -44,11 +45,11 @@ class SimpleGCN(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # Layer 1: 772 → 256
+        # Layer 1: 1028 → 512
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
         
-        # Layer 2: 256 → 128
+        # Layer 2: 512 → 128
         self.conv2 = GCNConv(hidden_dim, output_dim)
         self.bn2 = nn.BatchNorm1d(output_dim)
         
@@ -67,20 +68,12 @@ class SimpleGCN(nn.Module):
         Forward pass.
         
         Args:
-            x: Node features (N, 772)
+            x: Node features (N, 1028)
             edge_index: Edge connectivity (2, E)
             edge_weight: Edge weights (E,) - optional
         
         Returns:
             Graph embedding (128,)
-        
-        Examples:
-            >>> gcn = SimpleGCN()
-            >>> x = torch.randn(10, 772)  # 10 nodes
-            >>> edge_index = torch.tensor([[0,1,2], [1,2,0]])  # 3 edges
-            >>> embedding = gcn(x, edge_index)
-            >>> embedding.shape
-            torch.Size([128])
         """
         # Handle empty graph (single ticker node, no events)
         if x.size(0) == 1:
@@ -99,45 +92,64 @@ class SimpleGCN(nn.Module):
         x = self.dropout(x)
         
         # Global mean pooling
-        # Average all node embeddings to get graph-level embedding
         graph_embedding = x.mean(dim=0)  # (128,)
         
         return graph_embedding
     
     def forward_batch(
         self,
-        batch_graphs: list
+        batch_graphs: Union[List[Dict], List[Data]]
     ) -> torch.Tensor:
         """
         Process a batch of graphs.
         
+        FIXED: Support both dict and PyG Data objects
+        
         Args:
-            batch_graphs: List of graph dicts, each with:
-                - 'node_features': Tensor (N_i, 772)
-                - 'edge_index': Tensor (2, E_i)
-                - 'edge_weight': Tensor (E_i,)
+            batch_graphs: List of graphs, each can be:
+                - Dict with keys: 'node_features', 'edge_index', 'edge_weight'
+                - PyG Data object with attrs: x, edge_index, edge_weight
         
         Returns:
             Batch of embeddings (B, 128)
         
         Examples:
-            >>> graphs = [graph1, graph2, graph3]
+            >>> # With dicts
+            >>> graphs = [
+            ...     {'node_features': tensor(...), 'edge_index': tensor(...)},
+            ...     {'node_features': tensor(...), 'edge_index': tensor(...)}
+            ... ]
             >>> embeddings = gcn.forward_batch(graphs)
-            >>> embeddings.shape
-            torch.Size([3, 128])
+            
+            >>> # With PyG Data objects
+            >>> graphs = [Data(x=tensor(...), edge_index=tensor(...)), ...]
+            >>> embeddings = gcn.forward_batch(graphs)
         """
         embeddings = []
         
         for graph in batch_graphs:
-            x = graph['node_features']
-            edge_index = graph['edge_index']
-            edge_weight = graph.get('edge_weight')
+            # [FIX] Extract features based on type
+            if isinstance(graph, Data):
+                # PyG Data object - use attributes
+                x = graph.x
+                edge_index = graph.edge_index
+                edge_weight = getattr(graph, 'edge_weight', None)
+                
+            elif isinstance(graph, dict):
+                # Dict - use keys
+                x = graph.get('node_features') or graph.get('x')
+                edge_index = graph.get('edge_index')
+                edge_weight = graph.get('edge_weight')
+                
+            else:
+                raise TypeError(f"Expected Data or dict, got {type(graph)}")
             
             # Ensure tensors on same device
-            x = x.to(self.conv1.lin.weight.device)
-            edge_index = edge_index.to(self.conv1.lin.weight.device)
+            device = self.conv1.lin.weight.device
+            x = x.to(device)
+            edge_index = edge_index.to(device)
             if edge_weight is not None:
-                edge_weight = edge_weight.to(self.conv1.lin.weight.device)
+                edge_weight = edge_weight.to(device)
             
             emb = self.forward(x, edge_index, edge_weight)
             embeddings.append(emb)
@@ -154,8 +166,8 @@ class KnowledgeGraphEncoder(nn.Module):
     
     def __init__(
         self,
-        input_dim: int = 772,
-        hidden_dim: int = 256,
+        input_dim: int = 1028,
+        hidden_dim: int = 512,
         output_dim: int = 128,
         dropout: float = 0.1
     ):
@@ -163,9 +175,9 @@ class KnowledgeGraphEncoder(nn.Module):
         Initialize KG encoder.
         
         Args:
-            input_dim: Node feature dimension
-            hidden_dim: GCN hidden dimension
-            output_dim: Final embedding dimension (must match MSGCA dim)
+            input_dim: Node feature dimension (1028 for full Voyage)
+            hidden_dim: GCN hidden dimension (512)
+            output_dim: Final embedding dimension (128, must match MSGCA dim)
             dropout: Dropout rate
         """
         super().__init__()
@@ -173,13 +185,18 @@ class KnowledgeGraphEncoder(nn.Module):
         self.gcn = SimpleGCN(input_dim, hidden_dim, output_dim, dropout)
         self.output_dim = output_dim
     
-    def forward(self, graph_sequences: list) -> torch.Tensor:
+    def forward(
+        self, 
+        graph_sequences: List[List[Union[Dict, Data]]]
+    ) -> torch.Tensor:
         """
         Encode a batch of graph sequences.
         
         Args:
             graph_sequences: List of sequences, each a list of T graphs
                 Shape: (Batch, Time, Graph)
+                Each graph can be Dict or PyG Data
+                
                 Example: [
                     [graph_day1, graph_day2, ..., graph_day20],  # Sample 1
                     [graph_day1, graph_day2, ..., graph_day20],  # Sample 2
@@ -191,7 +208,7 @@ class KnowledgeGraphEncoder(nn.Module):
         
         Examples:
             >>> encoder = KnowledgeGraphEncoder()
-            >>> sequences = [[graph1, graph2], [graph3, graph4]]  # 2 samples, 2 days each
+            >>> sequences = [[graph1, graph2], [graph3, graph4]]
             >>> output = encoder(sequences)
             >>> output.shape
             torch.Size([2, 2, 128])
@@ -226,8 +243,8 @@ class GraphSAGEEncoder(nn.Module):
     
     def __init__(
         self,
-        input_dim: int = 772,
-        hidden_dim: int = 256,
+        input_dim: int = 1028,
+        hidden_dim: int = 512,
         output_dim: int = 128,
         dropout: float = 0.1
     ):

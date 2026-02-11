@@ -54,6 +54,8 @@ class GlobalConfig:
     
     # --- Voyage Embedding Settings (New) ---
     EMBED_MODEL = "voyage-3-large"
+    USE_VOYAGE_KG_EMBEDDINGS = True  # Set to False for random init
+    VOYAGE_KG_MODEL = 'voyage-finance-2'  # Finance-specific model (1024-dim)
     MAX_RETRIES = 6
     BACKOFF_BASE = 30
     MAX_TEXTS_PER_REQ = 40
@@ -101,7 +103,7 @@ class TrainConfig:
     # NEW: Knowledge Graph Settings
     # ============================================
     use_kg = True  # Enable/disable KG module
-    kg_input_dim = 772  # Node feature dimension
-    kg_hidden_dim = 256  # GCN hidden dimension
+    kg_input_dim = 1028  # Node feature dimension
+    kg_hidden_dim = 512  # GCN hidden dimension
     kg_output_dim = 128  # Must match 'dim' below
     kg_dropout = 0.1

@@ -50,32 +50,65 @@ class data_prepare:
     
     def _convert_dict_to_data(self, graph_dict):
         """
-        Helper: Convert Graph Dict (from pickle) to PyG Data Object.
-        Model requires Data object to access .x and .edge_index attributes.
-        """
-        if not HAS_PYG: return None
+        Convert Graph Dict to PyG Data Object.
         
-        # Nếu đã là Data object thì trả về luôn
+        FIXED: Proper tensor comparison
+        """
+        if not HAS_PYG:
+            return None
+            
+        # Already a Data object
         if isinstance(graph_dict, Data):
             return graph_dict
-            
-        # Nếu là Dict, convert sang Data
+        
+        # Convert dict to Data
         if isinstance(graph_dict, dict):
-            if 'x' not in graph_dict or len(graph_dict['x']) == 0:
+            # [FIX] Handle key names
+            node_features = graph_dict.get('node_features')
+            if node_features is None:
+                node_features = graph_dict.get('x')
+            
+            edge_index = graph_dict.get('edge_index')
+            
+            # [FIX] Proper validation - check shape instead of len
+            if node_features is None:
                 return self._get_empty_graph()
-            return Data(x=graph_dict['x'], edge_index=graph_dict['edge_index'])
+            
+            # [FIX] Handle both numpy and tensor
+            if isinstance(node_features, np.ndarray):
+                if node_features.shape[0] == 0:
+                    return self._get_empty_graph()
+                node_features = torch.from_numpy(node_features).float()
+            elif isinstance(node_features, torch.Tensor):
+                if node_features.shape[0] == 0:
+                    return self._get_empty_graph()
+            else:
+                return self._get_empty_graph()
+            
+            # Convert edge_index if needed
+            if isinstance(edge_index, np.ndarray):
+                edge_index = torch.from_numpy(edge_index).long()
+            
+            # Create Data object
+            return Data(
+                x=node_features,
+                edge_index=edge_index
+            )
             
         return self._get_empty_graph()
 
     def _get_empty_graph(self):
         """
-        Helper: Create a valid empty graph to prevent model crash.
-        """
-        if not HAS_PYG: return None
-        # Dim = 772 (Voyage 768 + 4 types) or from config
-        dim = getattr(TrainConfig, 'kg_input_dim', 772)
+        Create empty graph with correct dimensions.
         
-        # Create 1 dummy node with zeros
+        FIXED: Use consistent dimension from config
+        """
+        if not HAS_PYG:
+            return None
+        
+        # Get dimension from config (should be 1028 for full Voyage)
+        dim = getattr(TrainConfig, 'kg_input_dim', 1028)
+        
         x = torch.zeros((1, dim), dtype=torch.float32)
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         return Data(x=x, edge_index=edge_index)
@@ -123,6 +156,46 @@ class data_prepare:
             all_sequences.append(sequence)
         
         return all_sequences
+
+    def _normalize_date_key(self, date):
+        """
+        FIXED: Normalize date key for robust lookup.
+        
+        Handles: str, datetime, pd.Timestamp
+        """
+        # Try as-is first (fast path)
+        if date in self.kg_data:
+            return date
+        
+        # Convert to datetime
+        if isinstance(date, str):
+            try:
+                date = datetime.fromisoformat(date.replace('Z', ''))
+            except:
+                try:
+                    date = pd.to_datetime(date).to_pydatetime()
+                except:
+                    pass
+        elif isinstance(date, pd.Timestamp):
+            date = date.to_pydatetime()
+        
+        # Try again
+        if date in self.kg_data:
+            return date
+        
+        # Try date-only (strip time)
+        if hasattr(date, 'date'):
+            date_only = date.date()
+            if date_only in self.kg_data:
+                return date_only
+        
+        # Last resort: try all keys with matching date
+        for key in self.kg_data.keys():
+            if hasattr(key, 'date') and hasattr(date, 'date'):
+                if key.date() == date.date():
+                    return key
+        
+        return date  # Return original if no match
 
     def prepare_data(
         self,
@@ -239,18 +312,26 @@ class data_prepare:
         kg_sequences = None
         if TrainConfig.use_kg and self.kg_data and HAS_PYG:
             print(f"   🕸️  Preparing KG sequences for {stock_name}...")
-            # Use index (Dates) from price_df which is already aligned
             dates = list(price_df.index)
             
-            # Generate sequences
-            kg_sequences = self._get_kg_sequence(dates, stock_name, window_size)
-            
-            if kg_sequences:
-                # Align with other data (remove future days matches price_win slicing)
-                kg_sequences = kg_sequences[:-future_days]
-                print(f"   ✓ Prepared {len(kg_sequences)} KG sequences")
-            else:
-                print("   ⚠️  Failed to generate KG sequences.")
+            try:
+                kg_sequences = self._get_kg_sequence(dates, stock_name, window_size)
+                
+                if kg_sequences:
+                    # Align with other data
+                    kg_sequences = kg_sequences[:-future_days]
+                    
+                    # [FIX] Ensure same length
+                    min_len = min(len(price_win), len(kg_sequences))
+                    kg_sequences = kg_sequences[:min_len]
+                    
+                    print(f"   ✓ Prepared {len(kg_sequences)} KG sequences")
+                else:
+                    print("   ⚠️  Failed to generate KG sequences")
+                    
+            except Exception as e:
+                print(f"   ❌ KG sequence error: {e}")
+                kg_sequences = None
 
         # ==========================
         # 4. LABELING (Rolling Quantile)
