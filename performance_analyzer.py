@@ -13,7 +13,6 @@ from configs.config import TrainConfig, GlobalConfig
 # --- CONFIG ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_PATH = os.path.join("output", "best_model.pt")
-# Đảm bảo đường dẫn này trỏ đúng file pkl mới nhất
 DATA_PATH = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
 KG_PATH = GlobalConfig.KG_PROCESSED_PATH if getattr(TrainConfig, "use_kg", False) else None
 
@@ -26,7 +25,6 @@ def load_data_per_ticker(tickers):
     """
     Load dữ liệu Test riêng biệt cho từng mã để phân tích behavior.
     """
-    # Khởi tạo data_prepare với KG path
     dp = data_prepare(DATA_PATH, kg_data_path=KG_PATH)
     ticker_datasets = {}
     
@@ -36,7 +34,6 @@ def load_data_per_ticker(tickers):
         
     for t in tickers:
         try:
-            # prepare_data trả về: train, valid, test (index 2)
             _, _, test_data = dp.prepare_data(
                 stock_name=t,
                 window_size=TrainConfig.window_size,
@@ -59,24 +56,24 @@ def run_prediction(model, data_dict):
     model.eval()
     
     # Prepare KG data
-    s_kg = data_dict.get("s_kg") # List of lists
+    s_kg = data_dict.get("s_kg")
     
     with torch.no_grad():
-        # [CRITICAL FIX] Use keyword arguments matching updated model signature
-        acc, mcc, preds, logits = model(
+        # [CRITICAL FIX] Dùng keyword arguments và mode="inference"
+        logits = model(
             s_o=data_dict["s_o"].to(DEVICE),
             s_h=data_dict["s_h"].to(DEVICE),
             s_c=data_dict["s_c"].to(DEVICE),
             s_m=data_dict["s_m"].to(DEVICE),
             s_n=data_dict["s_n"].to(DEVICE),
-            s_kg=s_kg, # Pass KG data
+            s_kg=s_kg, 
             label=data_dict["label"].to(DEVICE),
-            mode="test",
-            return_logits=True # Request logits return
+            mode="inference"  # Dùng inference mode để tránh lỗi return_logits
         )
         
-        # Calculate probabilities
+        # Calculate probabilities & predictions
         probs = torch.softmax(logits, dim=1)
+        preds = torch.argmax(logits, dim=1)
         
     return preds.cpu().numpy(), data_dict["label"].numpy(), probs.cpu().numpy()
 
@@ -87,19 +84,18 @@ def analyze_performance():
         print(f"❌ Cannot find model at {MODEL_PATH}")
         return
 
-    # Lấy dimension macro thực tế để init model cho đúng
+    # Lấy dimension macro
     dp = data_prepare(DATA_PATH, kg_data_path=KG_PATH)
-    # Lấy thử 1 mã để check dimension
     dummy_train, _, _ = dp.prepare_data("TSLA") 
     if dummy_train:
         macro_dim = dummy_train["s_m"].shape[-1]
     else:
-        macro_dim = 6 # Fallback
+        macro_dim = 6 
     
     print(f"🔧 Model Config: Dim={TrainConfig.dim}, Heads={TrainConfig.num_head}, Macro={macro_dim}")
     print(f"🕸️  KG Enabled: {getattr(TrainConfig, 'use_kg', False)}")
 
-    # Khởi tạo model architecture
+    # Khởi tạo model
     model = StockMovementModel(
         price_dim=1,
         macro_dim=macro_dim,
@@ -110,13 +106,20 @@ def analyze_performance():
         num_head=TrainConfig.num_head,       
         device=DEVICE,
         dropout=0.0,                         
-        class_weights=None,                  
+        class_weights=None,  # Eval mode không cần weight -> Gây ra lỗi loss_fn.weight                
         use_focal_loss=False,                
-        use_kg=getattr(TrainConfig, "use_kg", False) # NEW
+        use_kg=getattr(TrainConfig, "use_kg", False)
     ).to(DEVICE)
     
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+        
+        # [FIX] Xóa key loss_fn.weight thừa (do lúc train dùng class_weights)
+        if "loss_fn.weight" in state_dict:
+            print("   ⚠️  Removing 'loss_fn.weight' from state_dict (not needed for inference)")
+            del state_dict["loss_fn.weight"]
+            
+        model.load_state_dict(state_dict, strict=True) # Strict=True để đảm bảo load đủ các layer quan trọng
         print("✅ Weights loaded successfully!")
     except Exception as e:
         print(f"❌ Error loading weights: {e}")
@@ -149,7 +152,6 @@ def analyze_performance():
         acc = accuracy_score(labels, preds)
         mcc = matthews_corrcoef(labels, preds)
         
-        # Count distributions
         act_counts = Counter(labels)
         pred_counts = Counter(preds)
         
@@ -171,7 +173,6 @@ def analyze_performance():
     act_dist_dict = dict(zip(unique_act, counts_act))
     print(f"   {act_dist_dict}")
     
-    # Tính toán tỷ lệ phần trăm
     total_act = sum(counts_act)
     if total_act > 0:
         p0 = act_dist_dict.get(0,0)/total_act*100
@@ -182,13 +183,11 @@ def analyze_performance():
     print("\n🔮 PREDICTED Labels Distribution:")
     print(f"   {dict(zip(unique_pred, counts_pred))}")
     
-    # Check Mode Collapse
     if len(unique_pred) == 1:
         print("\n⚠️  CRITICAL WARNING: MODE COLLAPSE DETECTED!")
-        print(f"   Mô hình chỉ dự đoán duy nhất lớp {unique_pred[0]} cho toàn bộ dữ liệu.")
+        print(f"   Mô hình chỉ dự đoán duy nhất lớp {unique_pred[0]}")
     
     print("\n📊 Confusion Matrix:")
-    # Handle cases where some classes are missing in predictions or labels
     labels_present = [0, 1, 2]
     cm = confusion_matrix(all_labels, all_preds, labels=labels_present)
     

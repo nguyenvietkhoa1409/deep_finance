@@ -96,8 +96,12 @@ class TrainConfig:
     epoch_num = 200
     # learning_rate = 1e-4
     learning_rate = 1e-4
-    weight_decay = 1e-5
-    drop_out = 0.1
+    weight_decay = 1e-4
+    drop_out = 0.2
+    
+    # Loss Strategy
+    use_focal_loss = False # TẮT FOCAL LOSS
+    label_smoothing = 0.1  # Bật Label Smoothing
     
     # ============================================
     # NEW: Knowledge Graph Settings

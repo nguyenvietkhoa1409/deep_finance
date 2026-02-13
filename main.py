@@ -181,7 +181,7 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         dropout=0.1,                          
         class_weights=class_weights, 
         use_focal_loss=True,
-        # use_kg=TrainConfig.use_kg, # Tùy chọn nếu model __init__ cần
+        use_kg=TrainConfig.use_kg, # Tùy chọn nếu model __init__ cần
         device=device
     ).to(device)
 
