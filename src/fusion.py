@@ -195,6 +195,7 @@ class StableGatedCrossAttention(nn.Module):
         
         # Wb trong Eq(14) / (19) - Biến đổi Stable feature để tạo Gate
         self.linear_b = nn.Linear(dim, dim)
+        nn.init.constant_(self.linear_b.bias, -2.0)
         
         # Layer Norm để ổn định training (Thực tế nên có sau MHA)
         self.norm = nn.LayerNorm(dim)
@@ -220,7 +221,7 @@ class StableGatedCrossAttention(nn.Module):
         
         # Tính Ha (Eq 13): Biến đổi đặc trưng vừa fuse
         h_a = self.linear_a(h_unstable_fused) # [B, T, D]
-        
+        h_a = self.dropout(h_a)
         # Tính Hb (Eq 14): Tính Gate dựa trên Stable Feature gốc
         # Đây là mấu chốt: Stable feature quyết định cái gì được đi qua
         gate = torch.sigmoid(self.linear_b(stable)) # [B, T, D]
@@ -229,6 +230,6 @@ class StableGatedCrossAttention(nn.Module):
         h_final = h_a * gate
         
         # Thêm LayerNorm cuối cùng để ổn định đầu ra
-        h_final = self.norm(h_final)
+        h_final = self.norm(self.dropout(h_final))
         
         return h_final

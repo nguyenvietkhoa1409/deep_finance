@@ -151,7 +151,7 @@ from configs.config import TrainConfig
 
 # Import KG Encoder an toàn
 try:
-    from encoders.kg_encoder import KnowledgeGraphEncoder
+    from encoders.hetero_kg_encoder import KnowledgeGraphEncoder
 except ImportError:
     pass
 
@@ -168,22 +168,33 @@ from configs.config import TrainConfig
 
 # Import KG Encoder an toàn
 try:
-    from encoders.kg_encoder import KnowledgeGraphEncoder
+    from encoders.hetero_kg_encoder import KnowledgeGraphEncoder
+except ImportError:
+    pass
+
+# FILE: src/model.py
+import torch
+from torch import nn
+from sklearn.metrics import accuracy_score, matthews_corrcoef
+import torch.nn.functional as F
+
+from encoders.mutil_encoder import MultimodalSourceEncoding
+from .fusion import StableGatedCrossAttention
+from .predictor import FinegrainedMovementPrediction
+from configs.config import TrainConfig
+
+# Import KG Encoder an toàn
+try:
+    from encoders.hetero_kg_encoder import HeteroKGSequenceEncoder
 except ImportError:
     pass
 
 class StockMovementModel(nn.Module):
     """
-    MSGCA Framework - Fully Sequential Fusion Architecture.
+    MSGCA Framework - Optimized Sequential Fusion (Re-ordered).
     
-    Logic bám sát Paper:
-    Fuse từng module một theo chuỗi (Cascade), dùng kết quả bước trước 
-    làm 'Stable Feature' để dẫn dắt bước sau.
-    
-    Flow:
-      1. Price (Stable gốc) + Macro -> Context_1
-      2. Context_1 (Stable mới) + News  -> Context_2
-      3. Context_2 (Stable mới) + KG    -> Final Representation
+    NEW ORDER: Price -> News -> Macro -> KG
+    REASON: Fuse High-Frequency Data (News) first, then Low-Frequency (Macro).
     """
     def __init__(
         self,
@@ -198,93 +209,88 @@ class StockMovementModel(nn.Module):
         dropout=0.1, 
         class_weights=None,
         use_focal_loss=False, 
-        use_kg=False,
+        use_kg=True,
+        label_smoothing = TrainConfig.label_smoothing
     ):
         super().__init__()
         self.device = device
         self.use_kg = use_kg
-
-        # 1. Encoders (Đưa mọi thứ về chiều `dim`)
+        self.label_smoothing = label_smoothing
+        # 1. Encoders
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim, macro_dim=macro_dim, news_dim=news_dim, dim=dim
         )
         
         if self.use_kg:
-            from encoders.kg_encoder import KnowledgeGraphEncoder
-            # Cấu hình KG Encoder
-            self.kg_encoder = KnowledgeGraphEncoder(
-                input_dim=getattr(TrainConfig, 'kg_input_dim', 772),
-                hidden_dim=getattr(TrainConfig, 'kg_hidden_dim', 128),
-                output_dim=getattr(TrainConfig, 'kg_output_dim', dim),
-                dropout=getattr(TrainConfig, 'kg_dropout', 0.1)
+            # [UPDATED] Use heterogeneous encoder
+            self.kg_encoder = HeteroKGSequenceEncoder(
+                ticker_input_dim=1028,      # Ticker node dim
+                event_input_dim=1805,       # Hybrid event node dim
+                hidden_dim=256,             # Increased for richer features
+                output_dim=dim,             # Must match MSGCA dim (128)
+                num_heads=4,
+                dropout=dropout
             )
-            print("🕸️  KG Module Initialized (Sequential Chain Mode)")
+            print("🕸️  Heterogeneous KG Module: ENABLED")
 
-        # 2. Sequential Fusion Modules (Từng bước một)
+        # 2. Sequential Fusion Modules (Re-ordered)
         
-        # Bước 1: Fusion Price & Macro
-        # Macro thường bổ trợ trực tiếp cho Price về mặt xu hướng vĩ mô
-        self.fusion_price_macro = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+        # [MODIFIED] Bước 1: Price & News (Thay vì Macro)
+        # News biến động nhanh, tương quan cao với Price -> Fuse trước
+        self.fusion_price_news = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         
-        # Bước 2: Fusion (Price+Macro) & News
-        # Dùng ngữ cảnh kinh tế đã fuse để tìm tin tức liên quan
-        self.fusion_with_news = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+        # [MODIFIED] Bước 2: Context & Macro
+        # Macro là xu hướng dài hạn, đóng vai trò điều chỉnh Context
+        self.fusion_with_macro = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         
-        # Bước 3: Fusion (Price+Macro+News) & KG
-        # KG là lớp thông tin ngữ nghĩa sâu nhất, được fuse cuối cùng
+        # Bước 3: Context & KG (Giữ nguyên vị trí cuối)
         if self.use_kg:
             self.fusion_with_kg = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
 
-        # 3. Predictor (Dynamic Attention Pooling)
+        # 3. Predictor
         self.movement_predictor = FinegrainedMovementPrediction(
             dim=dim, window_size=input_dim, num_classes=output_dim, dropout=dropout
         )
 
         # 4. Loss Function
-        # Sử dụng Label Smoothing để tránh Class Collapse (lớp Flat)
-        # Giữ nguyên khuyến nghị dùng CE thay vì Focal Loss cho dữ liệu nhỏ/nhiễu
-        self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        print("🔧 Loss Strategy: CrossEntropy with Label Smoothing=0.1")
+        self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        print(f"🔧 Loss Strategy: CrossEntropy with Label Smoothing={label_smoothing}")
 
     def forward(self, s_o, s_h, s_c, s_m, s_n, s_kg=None, label=None, mode="train"):
         # --- 1. Encoding ---
-        # v_i: Price (Indicator) - Stable Feature gốc
-        # v_m: Macro
-        # v_n: News
+        # v_i: Price (Indicator) - Stable Anchor
+        # v_n: News (Unstable 1)
+        # v_m: Macro (Unstable 2)
         v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
 
-        # --- 2. Fully Sequential Fusion (Cascade) ---
+        # --- 2. Sequential Fusion (Re-ordered + Residual Anchor) ---
         
-        # [STEP 1]: Price dẫn dắt Macro
-        # Query (Stable) = v_i (Price)
-        # Key/Value (Unstable) = v_m (Macro)
-        h_chain = self.fusion_price_macro(stable=v_i, unstable=v_m)
+        # [STEP 1]: Price dẫn dắt News (Quan trọng nhất)
+        # Query = v_i (Price)
+        # Key/Value = v_n (News)
+        h_chain = self.fusion_price_news(stable=v_i, unstable=v_n)
         
-        # [STEP 2]: Kết quả Step 1 dẫn dắt News
-        # Query (Stable) = h_chain (Price + Macro)
-        # Key/Value (Unstable) = v_n (News)
-        h_chain = self.fusion_with_news(stable=h_chain, unstable=v_n)
+        # [STEP 2]: (Price + News) dẫn dắt Macro
+        # [CRITICAL FIX]: Cộng lại v_i (Price) để "neo" tín hiệu.
+        # Nếu không cộng, h_chain có thể đã bị biến đổi quá xa so với Price gốc.
+        stable_for_macro = h_chain + v_i 
+        h_chain = self.fusion_with_macro(stable=stable_for_macro, unstable=v_m)
         
-        # [STEP 3]: Kết quả Step 2 dẫn dắt Knowledge Graph (Nếu có)
+        # [STEP 3]: (Price + News + Macro) dẫn dắt KG
         if self.use_kg and s_kg is not None:
             if isinstance(s_kg, list) and len(s_kg) > 0:
-                # Encode KG
-                v_kg = self.kg_encoder(s_kg) # [B, T, D]
+                v_kg = self.kg_encoder(s_kg)
                 v_kg = v_kg.to(v_i.device)
                 
-                # Query (Stable) = h_chain (Price + Macro + News)
-                # Key/Value (Unstable) = v_kg (Graph)
-                h_chain = self.fusion_with_kg(stable=h_chain, unstable=v_kg)
-            # Nếu không có KG, h_chain giữ nguyên kết quả từ Step 2
-
-        # h_chain bây giờ là vector đại diện cuối cùng (H_final)
+                # Tiếp tục "neo" bằng v_i
+                stable_for_kg = h_chain + v_i
+                h_chain = self.fusion_with_kg(stable=stable_for_kg, unstable=v_kg)
 
         # --- 3. Prediction ---
-        # Predictor dùng h_chain làm context, và v_i (Price gốc) để lấy Dynamic Query
-        # Điều này đảm bảo ta luôn đối chiếu lại với biến động giá thực tế
+        # Predictor vẫn đối chiếu kết quả chuỗi (h_chain) với Price gốc (v_i)
         logits = self.movement_predictor(fused_seq=h_chain, orig_seq=v_i)
         
-        # Clamp logits (Safety)
+        # Clamp logits
         logits = torch.clamp(logits, -15, 15)
 
         # --- 4. Return Output ---

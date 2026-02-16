@@ -53,7 +53,7 @@ class GlobalConfig:
     }
     
     # --- Voyage Embedding Settings (New) ---
-    EMBED_MODEL = "voyage-3-large"
+    EMBED_MODEL = "POLARITY_KEYWORDS"
     USE_VOYAGE_KG_EMBEDDINGS = True  # Set to False for random init
     VOYAGE_KG_MODEL = 'voyage-finance-2'  # Finance-specific model (1024-dim)
     MAX_RETRIES = 6
@@ -86,14 +86,14 @@ class TrainConfig:
     
     # --- MODEL HYPERPARAMETERS ---
     # Model Hidden Dimension (D): Kích thước vector sau khi encode và fusion
-    dim = 128
+    dim = 32
     # Output classes (Down, Flat, Up)
     output_dim = 3 
     #Attention heads
-    num_head = 4
+    num_head = 2
     
     # training
-    epoch_num = 200
+    epoch_num = 300
     # learning_rate = 1e-4
     learning_rate = 1e-4
     weight_decay = 1e-4
@@ -107,7 +107,10 @@ class TrainConfig:
     # NEW: Knowledge Graph Settings
     # ============================================
     use_kg = True  # Enable/disable KG module
-    kg_input_dim = 1028  # Node feature dimension
-    kg_hidden_dim = 512  # GCN hidden dimension
-    kg_output_dim = 128  # Must match 'dim' below
-    kg_dropout = 0.1
+    kg_graph_path = os.path.join(
+        GlobalConfig.KG_CACHE_DIR,
+        'hetero_kg_graphs.pkl'
+    )
+    use_hetero_kg = True # [NEW] Use heterogeneous graphs with hybrid features
+    kg_hidden_dim = 256  # [NEW] Hidden dimension for hetero GNN
+    kg_num_heads = 4     # [NEW] Attention heads for GAT

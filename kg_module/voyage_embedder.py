@@ -1,6 +1,7 @@
 """
 Voyage AI Embeddings for Knowledge Graph
 Generate high-quality embeddings for tickers and relations
+[UPDATED] Added parallel batch processing support
 """
 
 import os
@@ -10,6 +11,8 @@ import pickle
 from typing import Dict, List
 from tqdm import tqdm
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from configs.config import GlobalConfig
 
@@ -17,95 +20,83 @@ from configs.config import GlobalConfig
 class VoyageKGEmbedder:
     """
     Generate embeddings for KG components using Voyage Finance model.
-    
-    Features:
-    - Ticker embeddings from company descriptions
-    - Relation embeddings from financial keywords
-    - Automatic caching to avoid redundant API calls
+    [NEW] Supports parallel batch processing
     """
     
     def __init__(
         self,
         cache_dir: str = './data/interim/kg_cache',
-        model: str = 'voyage-finance-2'  # Voyage's finance-specific model
+        model: str = 'voyage-finance-2',
+        max_workers: int = 1  # [NEW] Parallel workers
     ):
-        """
-        Initialize Voyage embedder.
-        
-        Args:
-            cache_dir: Directory to cache embeddings
-            model: Voyage model to use (voyage-finance-2 for finance)
-        """
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         
         self.model = model
-        self.client = voyageai.Client(api_key=GlobalConfig.VOYAGE_API_KEY)
+        self.max_workers = max_workers  # [NEW]
         
-        # Cache paths
+        # Initialize Client safely
+        api_key = getattr(GlobalConfig, 'VOYAGE_API_KEY', None)
+        self.client = voyageai.Client(api_key=api_key) if api_key else None
+        
         self.ticker_cache_path = os.path.join(cache_dir, 'voyage_ticker_embeddings.pkl')
         self.relation_cache_path = os.path.join(cache_dir, 'voyage_relation_embeddings.pkl')
         
         # Rate limiting
-        self.sleep_time = GlobalConfig.VOYAGE_RATE_LIMITS[GlobalConfig.PAYMENT_ADDED]['SLEEP']
+        limits = getattr(GlobalConfig, 'VOYAGE_RATE_LIMITS', {True: {'SLEEP': 1.0}})
+        payment_added = getattr(GlobalConfig, 'PAYMENT_ADDED', True)
+        self.sleep_time = limits.get(payment_added, {'SLEEP': 1.0})['SLEEP']
+        
+        # [NEW] Thread safety
+        self.embeddings_lock = threading.Lock()
     
+    def _load_cache(self, path: str) -> Dict:
+        """Helper to safely load cache."""
+        if os.path.exists(path):
+            try:
+                with open(path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"   ⚠️  Cache corrupted at {path}: {e}")
+                print("   🔄 Will regenerate embeddings.")
+        return None
+
     def generate_ticker_embeddings(
         self,
         tickers: List[str],
         force_rebuild: bool = False
     ) -> Dict[str, np.ndarray]:
-        """
-        Generate embeddings for ticker symbols.
-        
-        Uses company descriptions to create meaningful embeddings instead of random vectors.
-        
-        Args:
-            tickers: List of ticker symbols
-            force_rebuild: Force regeneration even if cache exists
-        
-        Returns:
-            Dict mapping ticker → embedding array (1024-dim for voyage-finance-2)
-        
-        Example:
-            >>> embedder = VoyageKGEmbedder()
-            >>> embs = embedder.generate_ticker_embeddings(['AMZN', 'TSLA'])
-            >>> embs['AMZN'].shape
-            (1024,)
-        """
+        """Generate ticker embeddings with cache support."""
         # Check cache
-        if os.path.exists(self.ticker_cache_path) and not force_rebuild:
-            print("📦 Loading cached ticker embeddings...")
-            with open(self.ticker_cache_path, 'rb') as f:
-                cached = pickle.load(f)
-            
-            # Check if all tickers are cached
+        cached = None
+        if not force_rebuild:
+            cached = self._load_cache(self.ticker_cache_path)
+
+        if cached:
             missing = [t for t in tickers if t not in cached]
             if not missing:
                 print(f"   ✓ All {len(tickers)} tickers found in cache")
                 return cached
             else:
-                print(f"   ⚠️  {len(missing)} tickers missing, will generate")
+                print(f"   ⚠️  {len(missing)} tickers missing from cache")
         else:
             cached = {}
             missing = tickers
         
-        # Company descriptions for context
-        descriptions = self._get_company_descriptions()
-        
         # Generate embeddings for missing tickers
+        descriptions = self._get_company_descriptions()
         print(f"\n🚀 Generating Voyage embeddings for {len(missing)} tickers...")
         
         texts_to_embed = []
         ticker_order = []
         
         for ticker in missing:
-            # Create rich text prompt for better embeddings
             desc = descriptions.get(ticker, f"{ticker} stock")
             text = f"Company: {ticker}. {desc}"
             texts_to_embed.append(text)
             ticker_order.append(ticker)
         
-        # Batch embed with Voyage
+        # [UPDATED] Use parallel or serial batch embedding
         embeddings = self._batch_embed(texts_to_embed)
         
         # Update cache
@@ -116,8 +107,7 @@ class VoyageKGEmbedder:
         with open(self.ticker_cache_path, 'wb') as f:
             pickle.dump(cached, f)
         
-        print(f"   ✓ Generated and cached {len(missing)} new embeddings")
-        print(f"   📊 Embedding dimension: {cached[tickers[0]].shape[0]}")
+        print(f"   ✓ Generated and cached {len(missing)} ticker embeddings")
         
         return cached
     
@@ -126,57 +116,40 @@ class VoyageKGEmbedder:
         relation_types: Dict[str, Dict],
         force_rebuild: bool = False
     ) -> Dict[str, np.ndarray]:
-        """
-        Generate embeddings for relation types.
-        
-        Uses relation keywords to create meaningful embeddings.
-        
-        Args:
-            relation_types: Dict from config (RELATION_TYPES)
-            force_rebuild: Force regeneration
-        
-        Returns:
-            Dict mapping relation_name → embedding array
-        
-        Example:
-            >>> from kg_module.config import RELATION_TYPES
-            >>> embs = embedder.generate_relation_embeddings(RELATION_TYPES)
-            >>> embs['revenue_change'].shape
-            (1024,)
-        """
+        """Generate relation embeddings with cache support."""
         # Check cache
-        if os.path.exists(self.relation_cache_path) and not force_rebuild:
-            print("📦 Loading cached relation embeddings...")
-            with open(self.relation_cache_path, 'rb') as f:
-                cached = pickle.load(f)
+        cached = None
+        if not force_rebuild:
+            cached = self._load_cache(self.relation_cache_path)
             
-            # Check if all relations are cached
+        if cached:
             missing = [r for r in relation_types.keys() if r not in cached]
             if not missing:
                 print(f"   ✓ All {len(relation_types)} relations found in cache")
                 return cached
-            else:
-                print(f"   ⚠️  {len(missing)} relations missing, will generate")
         else:
             cached = {}
             missing = list(relation_types.keys())
         
-        # Generate embeddings for missing relations
         print(f"\n🚀 Generating Voyage embeddings for {len(missing)} relation types...")
         
         texts_to_embed = []
         relation_order = []
         
         for rel_name in missing:
-            rel_config = relation_types[rel_name]
-            keywords = rel_config.get('keywords', [])
+            # Handle different relation_types formats
+            if isinstance(relation_types, list):
+                keywords = []
+                print(f"   ⚠️ Warning: relation_types passed as List, expected Dict.")
+            else:
+                rel_config = relation_types.get(rel_name, {})
+                keywords = rel_config.get('keywords', [])
             
-            # Create descriptive text
             text = f"Financial event type: {rel_name.replace('_', ' ')}. Keywords: {', '.join(keywords)}"
             texts_to_embed.append(text)
             relation_order.append(rel_name)
         
-        # Batch embed
+        # [UPDATED] Use parallel or serial batch embedding
         embeddings = self._batch_embed(texts_to_embed)
         
         # Update cache
@@ -187,100 +160,158 @@ class VoyageKGEmbedder:
         with open(self.relation_cache_path, 'wb') as f:
             pickle.dump(cached, f)
         
-        print(f"   ✓ Generated and cached {len(missing)} new relation embeddings")
+        print(f"   ✓ Generated and cached {len(missing)} relation embeddings")
         
         return cached
     
     def _batch_embed(self, texts: List[str]) -> List[np.ndarray]:
         """
-        Embed texts in batches with rate limiting.
+        Batch embed texts with optional parallelization.
         
-        Args:
-            texts: List of text strings
-        
-        Returns:
-            List of embedding arrays
+        [UPDATED] Supports both serial and parallel processing
         """
-        batch_size = 40  # Voyage max batch size
+        if not self.client:
+            print("   ⚠️  Voyage Client not initialized (No API Key). Using Random.")
+            return [np.random.randn(1024).astype(np.float32) * 0.01 for _ in texts]
+
+        batch_size = 40  # Voyage optimal batch size
+        num_batches = (len(texts) + batch_size - 1) // batch_size
+        
+        print(f"   Processing {len(texts)} texts in {num_batches} batches...")
+        
+        if self.max_workers > 1 and num_batches > 1:
+            # Parallel processing
+            return self._batch_embed_parallel(texts, batch_size, num_batches)
+        else:
+            # Serial processing (original)
+            return self._batch_embed_serial(texts, batch_size)
+    
+    def _batch_embed_serial(self, texts: List[str], batch_size: int) -> List[np.ndarray]:
+        """Original serial batch embedding."""
         all_embeddings = []
         
         for i in tqdm(range(0, len(texts), batch_size), desc="Embedding batches"):
             batch = texts[i:i + batch_size]
-            
             try:
                 result = self.client.embed(
                     texts=batch,
                     model=self.model,
-                    input_type='document'  # For storage/retrieval
+                    input_type='document'
                 )
-                
-                # Convert to numpy arrays
-                batch_embeddings = [
-                    np.array(emb, dtype=np.float32) 
-                    for emb in result.embeddings
-                ]
-                
+                batch_embeddings = [np.array(emb, dtype=np.float32) for emb in result.embeddings]
                 all_embeddings.extend(batch_embeddings)
-                
-                # Rate limiting
                 time.sleep(self.sleep_time)
                 
             except Exception as e:
                 print(f"\n⚠️  Batch {i//batch_size} failed: {e}")
-                # Fallback to random for this batch
-                dim = 1024  # voyage-finance-2 dimension
+                print("   👉 Switching to Random Embeddings for this batch.")
                 for _ in range(len(batch)):
-                    all_embeddings.append(
-                        np.random.randn(dim).astype(np.float32) * 0.01
-                    )
+                    all_embeddings.append(np.random.randn(1024).astype(np.float32) * 0.01)
         
         return all_embeddings
     
+    def _batch_embed_parallel(
+        self, 
+        texts: List[str], 
+        batch_size: int,
+        num_batches: int
+    ) -> List[np.ndarray]:
+        """
+        [NEW] Parallel batch embedding.
+        
+        Uses ThreadPoolExecutor to process multiple batches concurrently.
+        """
+        print(f"   🚀 Parallel mode: {self.max_workers} workers")
+        
+        # Create batches
+        batches = []
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            batches.append((i, batch_texts))
+        
+        # Results storage (preserve order)
+        results = [None] * num_batches
+        
+        def embed_single_batch(batch_id, batch_texts):
+            """Embed a single batch (thread-safe)."""
+            try:
+                result = self.client.embed(
+                    texts=batch_texts,
+                    model=self.model,
+                    input_type='document'
+                )
+                batch_embeddings = [np.array(emb, dtype=np.float32) for emb in result.embeddings]
+                
+                # Sleep (reduced for parallel)
+                time.sleep(self.sleep_time / self.max_workers)
+                
+                return batch_id, batch_embeddings, None
+            
+            except Exception as e:
+                # Fallback: random embeddings
+                batch_embeddings = [
+                    np.random.randn(1024).astype(np.float32) * 0.01 
+                    for _ in batch_texts
+                ]
+                return batch_id, batch_embeddings, str(e)
+        
+        # Process in parallel
+        pbar = tqdm(total=num_batches, desc="Embedding batches (parallel)")
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all jobs
+            future_to_batch = {
+                executor.submit(embed_single_batch, batch_id, batch_texts): batch_id
+                for batch_id, batch_texts in enumerate(batches)
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_batch):
+                batch_id, batch_embeddings, error = future.result()
+                
+                if error:
+                    print(f"\n   ⚠️ Batch {batch_id} failed: {error}")
+                
+                results[batch_id] = batch_embeddings
+                pbar.update(1)
+        
+        pbar.close()
+        
+        # Flatten results (preserve order)
+        all_embeddings = []
+        for batch_embeddings in results:
+            if batch_embeddings:
+                all_embeddings.extend(batch_embeddings)
+        
+        return all_embeddings
+
     def _get_company_descriptions(self) -> Dict[str, str]:
-        """
-        Get company descriptions for tickers.
-        
-        Returns:
-            Dict mapping ticker → description
-        """
-        # Comprehensive descriptions for better embeddings
-        descriptions = {
-            'AMZN': 'Amazon.com Inc. is a multinational technology company focusing on e-commerce, cloud computing (AWS), digital streaming, and artificial intelligence. Key segments: Amazon Web Services, North America retail, International retail, subscription services.',
-            
-            'TSLA': 'Tesla Inc. designs, develops, manufactures and sells electric vehicles, battery energy storage systems, and solar energy products. Key products: Model S, Model 3, Model X, Model Y, Cybertruck, Powerwall, Solar Roof.',
-            
-            'MSFT': 'Microsoft Corporation develops, licenses, and supports software products, services and devices. Key segments: Productivity and Business Processes (Office, LinkedIn), Intelligent Cloud (Azure, SQL Server), More Personal Computing (Windows, Xbox, Surface).',
-            
-            'NFLX': 'Netflix Inc. is a streaming entertainment service company offering TV series, documentaries, and feature films across genres and languages. Operates in three segments: Domestic streaming, International streaming, Domestic DVD.',
-            
-            # Add more as needed
+        """Company descriptions for ticker embeddings."""
+        return {
+            'AMZN': 'Amazon.com Inc. technology e-commerce cloud computing AWS.',
+            'TSLA': 'Tesla Inc. electric vehicles energy storage solar.',
+            'MSFT': 'Microsoft Corporation software cloud services Azure.',
+            'NFLX': 'Netflix Inc. streaming entertainment content production.',
         }
-        
-        return descriptions
 
-
-# ============================================
-# UTILITY: Dimension Adapter
-# ============================================
 
 def adapt_embeddings_dimension(
-    embeddings: Dict[str, np.ndarray],
+    embeddings: Dict[str, np.ndarray], 
     target_dim: int = 768
 ) -> Dict[str, np.ndarray]:
     """
-    Adapt embeddings to target dimension if needed.
-    
-    Voyage-finance-2 produces 1024-dim vectors, but GCN expects 768-dim.
-    This function uses PCA or truncation to adapt.
+    Adapt embedding dimensions via truncation or padding.
     
     Args:
         embeddings: Dict of embeddings
         target_dim: Target dimension
     
     Returns:
-        Adapted embeddings dict
+        Adapted embeddings
     """
-    # Check current dimension
+    if not embeddings:
+        return {}
+    
     sample_key = next(iter(embeddings))
     current_dim = embeddings[sample_key].shape[0]
     
@@ -290,20 +321,12 @@ def adapt_embeddings_dimension(
     print(f"📐 Adapting embeddings: {current_dim}D → {target_dim}D")
     
     if current_dim > target_dim:
-        # Truncate (simple but effective)
-        # Keep most informative dimensions (assume Voyage puts important info first)
-        adapted = {
-            k: v[:target_dim] 
-            for k, v in embeddings.items()
-        }
-        print("   ✓ Truncated to target dimension")
-        
+        # Truncate
+        return {k: v[:target_dim] for k, v in embeddings.items()}
     else:
         # Pad with zeros
         adapted = {}
         for k, v in embeddings.items():
             padding = np.zeros(target_dim - current_dim, dtype=np.float32)
             adapted[k] = np.concatenate([v, padding])
-        print("   ✓ Padded to target dimension")
-    
-    return adapted
+        return adapted

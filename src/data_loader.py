@@ -2,35 +2,80 @@
 import pandas as pd
 import numpy as np
 import torch
-from configs.config import TrainConfig
+from configs.config import TrainConfig, GlobalConfig
 import pickle
 import os
 from datetime import datetime
 
-# Cố gắng import PyG Data
+# Try import PyG
 try:
-    from torch_geometric.data import Data
+    from torch_geometric.data import Data, HeteroData
     HAS_PYG = True
 except ImportError:
     HAS_PYG = False
     print("⚠️ Warning: torch_geometric not found. KG features will be disabled.")
 
 class data_prepare:
-    def __init__(self, data_path, kg_data_path=None) -> None:
+    def __init__(
+        self, 
+        data_path, 
+        kg_data_path=None,
+        hybrid_kg_path=None,
+        use_hetero_kg=True
+    ) -> None:
+        """
+        Initialize data loader.
+        
+        Args:
+            data_path: Path to main pickle (date-keyed format)
+            kg_data_path: [LEGACY] Path to old KG embeddings
+            hybrid_kg_path: [NEW] Path to hybrid KG graphs
+            use_hetero_kg: Use heterogeneous graphs (True) or legacy (False)
+        """
         self.data_path = data_path
         self.kg_data_path = kg_data_path
+        self.hybrid_kg_path = hybrid_kg_path
+        self.use_hetero_kg = use_hetero_kg
         
-        # Load KG data if provided
+        # Load KG data
         self.kg_data = None
-        if kg_data_path and os.path.exists(kg_data_path) and HAS_PYG:
-            print(f"📦 Loading KG data from {kg_data_path}...")
-            try:
-                with open(kg_data_path, 'rb') as f:
-                    self.kg_data = pickle.load(f)
-                print(f"   ✓ Loaded KG graphs for {len(self.kg_data)} dates")
-            except Exception as e:
-                print(f"   ❌ Error loading KG data: {e}")
-                self.kg_data = None
+        
+        if use_hetero_kg and hybrid_kg_path:
+            self._load_hybrid_kg_data()
+        elif kg_data_path and os.path.exists(kg_data_path):
+            self._load_legacy_kg_data()
+
+    def _load_hybrid_kg_data(self):
+        """Load hybrid heterogeneous graphs."""
+        if self.hybrid_kg_path is None:
+            self.hybrid_kg_path = os.path.join(
+                GlobalConfig.KG_CACHE_DIR,
+                'hetero_kg_graphs.pkl'
+            )
+        
+        if not os.path.exists(self.hybrid_kg_path):
+            print(f"   ⚠️  Hybrid KG graphs not found at {self.hybrid_kg_path}")
+            return
+        
+        print(f"🕸️  Loading HYBRID KG graphs from {self.hybrid_kg_path}...")
+        try:
+            with open(self.hybrid_kg_path, 'rb') as f:
+                self.kg_data = pickle.load(f)
+            print(f"   ✓ Loaded hetero graphs for {len(self.kg_data)} dates")
+        except Exception as e:
+            print(f"   ❌ Error loading hybrid KG: {e}")
+            self.kg_data = None
+
+    def _load_legacy_kg_data(self):
+        """Load legacy KG embeddings."""
+        print(f"📊 Loading LEGACY KG data from {self.kg_data_path}...")
+        try:
+            with open(self.kg_data_path, 'rb') as f:
+                self.kg_data = pickle.load(f)
+            print(f"   ✓ Loaded legacy KG data")
+        except Exception as e:
+            print(f"   ❌ Error loading legacy KG: {e}")
+            self.kg_data = None
 
     def create_return(self, price_df):
         df = price_df.copy()
@@ -48,33 +93,45 @@ class data_prepare:
             X.append(data[i:i + window_size])
         return np.array(X)
     
-    def _convert_dict_to_data(self, graph_dict):
+    def _convert_hetero_to_legacy(self, hetero_graph):
         """
-        Convert Graph Dict to PyG Data Object.
+        [NEW] Convert HeteroData to legacy Data format for backward compatibility.
         
-        FIXED: Proper tensor comparison
+        Strategy: Extract ticker node features as graph embedding
         """
+        if not HAS_PYG:
+            return None
+        
+        if isinstance(hetero_graph, HeteroData):
+            # Extract ticker node embedding
+            ticker_features = hetero_graph['ticker'].x  # Shape: (1, 1028)
+            
+            # Create simple Data object with single node
+            return Data(
+                x=ticker_features,
+                edge_index=torch.zeros((2, 0), dtype=torch.long)
+            )
+        
+        return hetero_graph
+    
+    def _convert_dict_to_data(self, graph_dict):
+        """Convert Graph Dict to PyG Data Object."""
         if not HAS_PYG:
             return None
             
         # Already a Data object
-        if isinstance(graph_dict, Data):
+        if isinstance(graph_dict, (Data, HeteroData)):
             return graph_dict
         
         # Convert dict to Data
         if isinstance(graph_dict, dict):
-            # [FIX] Handle key names
-            node_features = graph_dict.get('node_features')
-            if node_features is None:
-                node_features = graph_dict.get('x')
-            
+            node_features = graph_dict.get('node_features') or graph_dict.get('x')
             edge_index = graph_dict.get('edge_index')
             
-            # [FIX] Proper validation - check shape instead of len
             if node_features is None:
                 return self._get_empty_graph()
             
-            # [FIX] Handle both numpy and tensor
+            # Handle both numpy and tensor
             if isinstance(node_features, np.ndarray):
                 if node_features.shape[0] == 0:
                     return self._get_empty_graph()
@@ -89,67 +146,76 @@ class data_prepare:
             if isinstance(edge_index, np.ndarray):
                 edge_index = torch.from_numpy(edge_index).long()
             
-            # Create Data object
-            return Data(
-                x=node_features,
-                edge_index=edge_index
-            )
+            return Data(x=node_features, edge_index=edge_index)
             
         return self._get_empty_graph()
 
     def _get_empty_graph(self):
-        """
-        Create empty graph with correct dimensions.
-        
-        FIXED: Use consistent dimension from config
-        """
+        """Create empty graph."""
         if not HAS_PYG:
             return None
         
-        # Get dimension from config (should be 1028 for full Voyage)
         dim = getattr(TrainConfig, 'kg_input_dim', 1028)
-        
         x = torch.zeros((1, dim), dtype=torch.float32)
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         return Data(x=x, edge_index=edge_index)
+    
+    def _get_empty_hetero_graph(self):
+        """[NEW] Create empty HeteroData graph."""
+        if not HAS_PYG:
+            return None
+        
+        graph = HeteroData()
+        graph['ticker'].x = torch.zeros((1, 1028), dtype=torch.float32)
+        graph['event'].x = torch.zeros((0, 1805), dtype=torch.float32)
+        graph['ticker', 'has_event', 'event'].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        graph['event', 'affects', 'ticker'].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        return graph
 
     def _get_kg_sequence(self, dates, ticker, window_size):
         """
         Extract KG graph sequence for given dates.
-        Returns: List of Lists of PyG Data objects (length = N windows)
+        
+        [UPDATED] Supports both legacy Data and HeteroData
+        
+        Returns: 
+            - List of Lists of HeteroData (if use_hetero_kg=True)
+            - List of Lists of Data (if use_hetero_kg=False)
         """
         if not self.kg_data:
             return None
         
         all_sequences = []
         
-        # Iterate to create windows (Logic matches make_window)
+        # Iterate to create windows
         for i in range(len(dates) - window_size + 1):
             window_dates = dates[i : i + window_size]
             
             sequence = []
             for date in window_dates:
-                # 1. Normalize Date Key
-                date_key = date
-                # Try direct lookup first
-                if date_key not in self.kg_data:
-                    # Try converting to python datetime if it's Timestamp
-                    if isinstance(date, pd.Timestamp):
-                        date_key = date.to_pydatetime()
-                    elif isinstance(date, str):
-                        try:
-                            date_key = datetime.fromisoformat(date)
-                        except: pass
+                # Normalize date key
+                date_key = self._normalize_date_key(date)
                 
-                # 2. Fetch Graph
+                # Fetch graph
                 graph = None
-                if date_key in self.kg_data and ticker in self.kg_data[date_key]:
-                    raw_graph = self.kg_data[date_key][ticker]
-                    graph = self._convert_dict_to_data(raw_graph)
+                if date_key in self.kg_data:
+                    if ticker in self.kg_data[date_key]:
+                        raw_graph = self.kg_data[date_key][ticker]
+                        
+                        # [NEW] Handle HeteroData
+                        if isinstance(raw_graph, HeteroData):
+                            graph = raw_graph
+                        elif isinstance(raw_graph, Data):
+                            graph = raw_graph
+                        else:
+                            graph = self._convert_dict_to_data(raw_graph)
                 
-                # 3. Fallback to Empty
+                # Fallback to empty
                 if graph is None:
-                    graph = self._get_empty_graph()
+                    if self.use_hetero_kg:
+                        graph = self._get_empty_hetero_graph()
+                    else:
+                        graph = self._get_empty_graph()
                 
                 sequence.append(graph)
             
@@ -159,10 +225,13 @@ class data_prepare:
 
     def _normalize_date_key(self, date):
         """
-        FIXED: Normalize date key for robust lookup.
+        Normalize date key for robust lookup.
         
-        Handles: str, datetime, pd.Timestamp
+        Handles: str, datetime, pd.Timestamp, datetime.date
         """
+        if not self.kg_data:
+            return date
+        
         # Try as-is first (fast path)
         if date in self.kg_data:
             return date
@@ -194,8 +263,12 @@ class data_prepare:
             if hasattr(key, 'date') and hasattr(date, 'date'):
                 if key.date() == date.date():
                     return key
+            # Also try datetime.date comparison
+            if isinstance(key, datetime) and hasattr(date, 'date'):
+                if key.date() == date.date():
+                    return key
         
-        return date  # Return original if no match
+        return date
 
     def prepare_data(
         self,
@@ -277,7 +350,7 @@ class data_prepare:
         price_df = np.log(price_df / price_df.shift(1))
         price_df.dropna(inplace=True)
 
-        # Align Step 2 (Final Alignment)
+        # Align Step 2
         macro_df  = macro_df.loc[price_df.index]
         news_df   = news_df.loc[price_df.index]
         return_df = return_df.loc[price_df.index]
@@ -301,7 +374,7 @@ class data_prepare:
         # Label slicing
         label_raw = return_np[window_size - 1 + future_days:]
         
-        # Input slicing (Align with labels)
+        # Input slicing
         price_win = price_win[:-future_days]
         macro_win = macro_win[:-future_days]
         news_win  = news_win[:-future_days]
@@ -321,25 +394,30 @@ class data_prepare:
                     # Align with other data
                     kg_sequences = kg_sequences[:-future_days]
                     
-                    # [FIX] Ensure same length
+                    # Ensure same length
                     min_len = min(len(price_win), len(kg_sequences))
                     kg_sequences = kg_sequences[:min_len]
                     
                     print(f"   ✓ Prepared {len(kg_sequences)} KG sequences")
+                    if self.use_hetero_kg:
+                        print(f"   ✓ Format: HeteroData (hybrid features)")
+                    else:
+                        print(f"   ✓ Format: Data (legacy)")
                 else:
                     print("   ⚠️  Failed to generate KG sequences")
                     
             except Exception as e:
                 print(f"   ❌ KG sequence error: {e}")
+                import traceback
+                traceback.print_exc()
                 kg_sequences = None
 
         # ==========================
-        # 4. LABELING (Rolling Quantile)
+        # 4. LABELING
         # ==========================
         full_returns_series = pd.Series(return_np.flatten())
         rolling_window = 20
         
-        # Calculate thresholds (Shift 1 to avoid look-ahead)
         roll_low  = full_returns_series.rolling(window=rolling_window).quantile(0.33).shift(1)
         roll_high = full_returns_series.rolling(window=rolling_window).quantile(0.66).shift(1)
         
@@ -354,19 +432,17 @@ class data_prepare:
         labels_temp[is_noise] = 1
         labels_temp[np.isnan(roll_low)] = 1
         
-        # Align labels
         start_idx = window_size - 1 + future_days
         if start_idx < len(labels_temp):
             label_all = labels_temp[start_idx:]
         else:
             label_all = np.array([])
 
-        # Check lengths consistency
+        # Synchronize lengths
         min_len = min(len(price_win), len(label_all))
         if kg_sequences:
             min_len = min(min_len, len(kg_sequences))
             
-        # Truncate to min_len to ensure synchronization
         price_win = price_win[:min_len]
         macro_win = macro_win[:min_len]
         news_win  = news_win[:min_len]
@@ -374,7 +450,7 @@ class data_prepare:
         if kg_sequences:
             kg_sequences = kg_sequences[:min_len]
 
-        # Label Distribution Logging
+        # Label stats
         unique, counts = np.unique(label_all, return_counts=True)
         dist = dict(zip(unique, counts))
         total_lbl = sum(counts)
@@ -386,7 +462,7 @@ class data_prepare:
             print(f"      Down: {p0:.2%}, Flat: {p1:.2%}, Up: {p2:.2%}")
 
         # ==========================
-        # 5. SPLIT DATASETS
+        # 5. SPLIT
         # ==========================
         total_len = len(price_win)
         idx_train = int(total_len * train_ratio)

@@ -32,7 +32,7 @@ class StockDataset(Dataset):
         self.s_m = data_dict["s_m"]
         self.s_n = data_dict["s_n"]
         self.label = data_dict["label"]
-        # [FIX] Load s_kg nếu có
+        # Load s_kg nếu có (có thể là Tensor hoặc List[HeteroData])
         self.s_kg = data_dict.get("s_kg")
 
     def __len__(self):
@@ -47,12 +47,11 @@ class StockDataset(Dataset):
             "s_n": self.s_n[idx],
             "label": self.label[idx],
         }
-        # [FIX] Trả về s_kg cho item
         if self.s_kg is not None:
             item["s_kg"] = self.s_kg[idx]
         return item
 
-# [FIX] Custom Collate để xử lý List of Graphs (tránh lỗi stack tensor)
+# Custom Collate để xử lý cả Tensor và List of Graphs
 def collate_fn(batch):
     s_o = torch.stack([item["s_o"] for item in batch])
     s_h = torch.stack([item["s_h"] for item in batch])
@@ -63,7 +62,13 @@ def collate_fn(batch):
     
     s_kg = None
     if "s_kg" in batch[0]:
-        s_kg = [item["s_kg"] for item in batch] # Giữ nguyên là List
+        # Check if it's a list (hetero graphs) or tensor (legacy)
+        if isinstance(batch[0]["s_kg"], list):
+            # Hetero graphs: keep as list
+            s_kg = [item["s_kg"] for item in batch]
+        else:
+            # Legacy tensor: stack
+            s_kg = torch.stack([item["s_kg"] for item in batch])
         
     return {
         "s_o": s_o, "s_h": s_h, "s_c": s_c, "s_m": s_m, "s_n": s_n, 
@@ -73,7 +78,6 @@ def collate_fn(batch):
 def merge_datasets(list_of_dicts, shuffle: bool = False):
     if not list_of_dicts: return {}
     
-    # Lấy key từ phần tử hợp lệ đầu tiên
     first_valid = next((d for d in list_of_dicts if d), None)
     if not first_valid: return {}
     keys = list(first_valid.keys())
@@ -81,14 +85,23 @@ def merge_datasets(list_of_dicts, shuffle: bool = False):
     merged = {}
     for k in keys:
         if k == "s_kg":
-            # [FIX] Merge List cho KG
-            parts = []
-            for d in list_of_dicts:
-                if d and k in d:
-                    parts.extend(d[k])
-            if parts: merged[k] = parts
+            # Check type of first element
+            first_kg = next((d[k] for d in list_of_dicts if d and k in d), None)
+            
+            if first_kg is not None and isinstance(first_kg, list):
+                # List of graphs: extend
+                parts = []
+                for d in list_of_dicts:
+                    if d and k in d:
+                        parts.extend(d[k])
+                if parts: merged[k] = parts
+            else:
+                # Tensor: concatenate
+                parts = [d[k] for d in list_of_dicts if d and k in d and isinstance(d[k], torch.Tensor)]
+                if parts:
+                    merged[k] = torch.cat(parts, dim=0)
         else:
-            # Merge Tensor
+            # Regular tensor merge
             parts = [d[k] for d in list_of_dicts if d and k in d and isinstance(d[k], torch.Tensor)]
             if parts:
                 merged[k] = torch.cat(parts, dim=0)
@@ -96,8 +109,8 @@ def merge_datasets(list_of_dicts, shuffle: bool = False):
     if shuffle and "label" in merged:
         idx = torch.randperm(len(merged["label"]))
         for k in merged:
-            if k == "s_kg":
-                merged[k] = [merged[k][i] for i in idx]
+            if k == "s_kg" and isinstance(merged[k], list):
+                merged[k] = [merged[k][i] for i in idx.tolist()]
             else:
                 merged[k] = merged[k][idx]
     return merged
@@ -129,11 +142,9 @@ def evaluate(model: torch.nn.Module, data_dict: dict):
         return 0.0, 0.0
     model.eval()
     
-    # [FIX] Xử lý s_kg cho evaluate
     s_kg = data_dict.get("s_kg")
     
     with torch.no_grad():
-        # [FIX] Dùng Keyword Arguments (s_kg=..., label=...)
         acc, mcc = model(
             s_o=data_dict["s_o"].to(device),
             s_h=data_dict["s_h"].to(device),
@@ -159,7 +170,6 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
     real_batch_size = getattr(TrainConfig, "batch_size", 128)
     print(f"   ► Batch Size: {real_batch_size}")
     
-    # [FIX] Thêm collate_fn vào DataLoader
     train_loader = DataLoader(
         StockDataset(train_data), 
         batch_size=real_batch_size, 
@@ -178,10 +188,10 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         input_dim=TrainConfig.window_size,   
         output_dim=TrainConfig.output_dim,   
         num_head=TrainConfig.num_head,
-        dropout=0.1,                          
+        dropout=0.2,                          
         class_weights=class_weights, 
         use_focal_loss=True,
-        use_kg=TrainConfig.use_kg, # Tùy chọn nếu model __init__ cần
+        use_kg=TrainConfig.use_kg,
         device=device
     ).to(device)
 
@@ -209,14 +219,13 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         for batch in train_loader:
             optimizer.zero_grad()
             
-            # [CRITICAL FIX] Dùng Keyword Arguments để tránh nhầm lẫn vị trí
             loss = model(
                 s_o=batch["s_o"].to(device), 
                 s_h=batch["s_h"].to(device),
                 s_c=batch["s_c"].to(device), 
                 s_m=batch["s_m"].to(device),
                 s_n=batch["s_n"].to(device), 
-                s_kg=batch.get("s_kg"), # Truyền s_kg riêng
+                s_kg=batch.get("s_kg"),
                 label=batch["label"].to(device),
                 mode="train"
             )
@@ -263,17 +272,42 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
     else:
         print("⚠️ No best model saved.")
 
+# --- 6. MAIN ---
 if __name__ == "__main__":
     pkl_path = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
-    # [FIX] Load đường dẫn KG nếu config bật
-    kg_path = GlobalConfig.KG_PROCESSED_PATH if getattr(TrainConfig, "use_kg", False) else None
+    
+    # [UPDATED] Support both legacy KG and hybrid KG
+    use_kg = getattr(TrainConfig, "use_kg", False)
+    use_hetero_kg = getattr(TrainConfig, "use_hetero_kg", True)  # Default to new mode
+    
+    if use_kg:
+        if use_hetero_kg:
+            # Use new hybrid KG
+            hybrid_kg_path = os.path.join(GlobalConfig.KG_CACHE_DIR, 'hetero_kg_graphs.pkl')
+            kg_path = None
+            print(f"🕸️  Using HYBRID Heterogeneous KG: {hybrid_kg_path}")
+        else:
+            # Use legacy KG
+            kg_path = GlobalConfig.KG_PROCESSED_PATH
+            hybrid_kg_path = None
+            print(f"📊 Using LEGACY KG embeddings: {kg_path}")
+    else:
+        kg_path = None
+        hybrid_kg_path = None
+        print("⚠️  KG disabled")
     
     print(f"📦 Loading processed dataset from: {pkl_path}")
     if not os.path.exists(pkl_path):
+        print(f"❌ File not found: {pkl_path}")
         raise SystemExit(1)
     
-    # Init loader với KG path
-    dp = data_prepare(pkl_path, kg_data_path=kg_path)
+    # [UPDATED] Init loader with both KG options
+    dp = data_prepare(
+        pkl_path, 
+        kg_data_path=kg_path,
+        hybrid_kg_path=hybrid_kg_path,
+        use_hetero_kg=use_hetero_kg
+    )
     
     target_tickers = getattr(GlobalConfig, "TICKERS", ["TSLA", "AMZN", "MSFT", "NFLX"])
     list_train, list_valid, list_test = [], [], []
