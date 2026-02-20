@@ -208,8 +208,8 @@ class HeteroKGSequenceEncoder(nn.Module):
         self,
         ticker_input_dim: int = 1028,
         event_input_dim: int = 1805,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
+        hidden_dim: int = 512,
+        output_dim: int = 256,
         num_heads: int = 4,
         dropout: float = 0.1
     ):

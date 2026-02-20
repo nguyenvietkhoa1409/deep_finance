@@ -233,3 +233,14 @@ class StableGatedCrossAttention(nn.Module):
         h_final = self.norm(self.dropout(h_final))
         
         return h_final
+        # attn_out, _ = self.mha(query=stable, key=unstable, value=unstable)
+        
+        # h_a = self.linear_a(attn_out)
+        # gate = torch.sigmoid(self.linear_b(stable))
+        
+        # # [FIX] Highway-style gating
+        # gated_new = h_a * gate
+        # gated_stable = stable * (1.0 - gate)  # Complementary
+        
+        # h_final = self.norm(gated_new + gated_stable)  # Both paths
+        # return h_final

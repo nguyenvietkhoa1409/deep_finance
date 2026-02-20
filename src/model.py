@@ -290,6 +290,22 @@ class StockMovementModel(nn.Module):
         # Predictor vẫn đối chiếu kết quả chuỗi (h_chain) với Price gốc (v_i)
         logits = self.movement_predictor(fused_seq=h_chain, orig_seq=v_i)
         
+        # v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
+        # # Sequential fusion WITHOUT intermediate residuals
+        # h1 = self.fusion_price_news(stable=v_i, unstable=v_n)
+        # h2 = self.fusion_with_macro(stable=h1, unstable=v_m)  # ← Remove + v_i
+        
+        # if self.use_kg and s_kg is not None:
+        #     v_kg = self.kg_encoder(s_kg)
+        #     h3 = self.fusion_with_kg(stable=h2, unstable=v_kg)  # ← Remove + v_i
+        # else:
+        #     h3 = h2
+        
+        # # Single residual at the end
+        # h_final = h3 + v_i  # ← Only here
+        
+        # logits = self.movement_predictor(fused_seq=h_final, orig_seq=v_i)
+        
         # Clamp logits
         logits = torch.clamp(logits, -15, 15)
 

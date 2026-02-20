@@ -147,30 +147,101 @@
 #         return logits
 
 # FILE: src/predictor.py
+# import torch
+# import torch.nn as nn
+
+# class FinegrainedMovementPrediction(nn.Module):
+#     """
+#     Predictor v2.0: Dynamic Attention Pooling.
+#     Sử dụng trạng thái cuối cùng của chuỗi giá (Last Price State) làm Query 
+#     để tổng hợp thông tin từ toàn bộ chuỗi Fused Features.
+#     """
+#     def __init__(self, dim, window_size, num_classes=3, dropout=0.1):
+#         super().__init__()
+        
+#         # Attention Pooling cho nhánh Fused Features
+#         self.attn_pool = nn.MultiheadAttention(
+#             embed_dim=dim, 
+#             num_heads=4, 
+#             batch_first=True, 
+#             dropout=dropout
+#         )
+        
+#         # Final Classifier
+#         # Input dim = dim * 2 (Vì ta nối Fused Context + Last Price State)
+#         self.classifier = nn.Sequential(
+#             nn.Linear(dim * 2, dim),
+#             nn.LayerNorm(dim),
+#             nn.GELU(),
+#             nn.Dropout(dropout),
+#             nn.Linear(dim, num_classes)
+#         )
+
+#     def forward(self, fused_seq, orig_seq):
+#         """
+#         Args:
+#             fused_seq: [B, T, D] - Kết quả cuối cùng của chuỗi Fusion
+#             orig_seq:  [B, T, D] - Chuỗi Price gốc (để lấy Dynamic Query)
+#         """
+#         # 1. Lấy Dynamic Query: Trạng thái của ngày cuối cùng (t)
+#         # Đây là thông tin quan trọng nhất: "Vị thế thị trường hôm nay"
+#         last_step_price = orig_seq[:, -1:, :] # [B, 1, D]
+        
+#         # 2. Attention Pooling
+#         # Hỏi: "Dựa trên giá hôm nay, hãy quét quá khứ (fused_seq) để tìm tín hiệu?"
+#         context, _ = self.attn_pool(
+#             query=last_step_price,
+#             key=fused_seq,
+#             value=fused_seq
+#         )
+#         # context: [B, 1, D] -> squeeze -> [B, D]
+#         context = context.squeeze(1)
+        
+#         # 3. Feature Combination
+#         # Kết hợp Context tìm được với chính trạng thái hiện tại (Residual-like)
+#         last_step_flat = last_step_price.squeeze(1) # [B, D]
+        
+#         combined = torch.cat([context, last_step_flat], dim=-1) # [B, 2D]
+        
+#         # 4. Classify
+#         logits = self.classifier(combined)
+        
+#         return logits
+
+# FILE: src/predictor.py
 import torch
 import torch.nn as nn
 
 class FinegrainedMovementPrediction(nn.Module):
     """
-    Predictor v2.0: Dynamic Attention Pooling.
-    Sử dụng trạng thái cuối cùng của chuỗi giá (Last Price State) làm Query 
-    để tổng hợp thông tin từ toàn bộ chuỗi Fused Features.
+    [ALTERNATIVE] Hybrid: Learnable Query + Price Context
+    Simpler than V4 but still uses ALL timesteps
     """
     def __init__(self, dim, window_size, num_classes=3, dropout=0.1):
         super().__init__()
         
-        # Attention Pooling cho nhánh Fused Features
-        self.attn_pool = nn.MultiheadAttention(
-            embed_dim=dim, 
-            num_heads=4, 
-            batch_first=True, 
-            dropout=dropout
+        # Learnable query (global pattern seeker)
+        self.query_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        
+        # Attention pooling
+        self.attn_fused = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=4, batch_first=True, dropout=dropout
+        )
+        self.attn_orig = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=4, batch_first=True, dropout=dropout
         )
         
-        # Final Classifier
-        # Input dim = dim * 2 (Vì ta nối Fused Context + Last Price State)
+        # Price context encoder (uses ALL timesteps)
+        self.price_context = nn.Sequential(
+            nn.Linear(dim * window_size, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Classifier (now 3*dim input)
         self.classifier = nn.Sequential(
-            nn.Linear(dim * 2, dim),
+            nn.Linear(3 * dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -178,32 +249,25 @@ class FinegrainedMovementPrediction(nn.Module):
         )
 
     def forward(self, fused_seq, orig_seq):
-        """
-        Args:
-            fused_seq: [B, T, D] - Kết quả cuối cùng của chuỗi Fusion
-            orig_seq:  [B, T, D] - Chuỗi Price gốc (để lấy Dynamic Query)
-        """
-        # 1. Lấy Dynamic Query: Trạng thái của ngày cuối cùng (t)
-        # Đây là thông tin quan trọng nhất: "Vị thế thị trường hôm nay"
-        last_step_price = orig_seq[:, -1:, :] # [B, 1, D]
+        B, T, D = fused_seq.shape
         
-        # 2. Attention Pooling
-        # Hỏi: "Dựa trên giá hôm nay, hãy quét quá khứ (fused_seq) để tìm tín hiệu?"
-        context, _ = self.attn_pool(
-            query=last_step_price,
-            key=fused_seq,
-            value=fused_seq
-        )
-        # context: [B, 1, D] -> squeeze -> [B, D]
-        context = context.squeeze(1)
+        # 1. Learnable query attention (fused)
+        query = self.query_token.expand(B, -1, -1)
+        h_fused, _ = self.attn_fused(query, fused_seq, fused_seq)
+        h_fused = h_fused.squeeze(1)
         
-        # 3. Feature Combination
-        # Kết hợp Context tìm được với chính trạng thái hiện tại (Residual-like)
-        last_step_flat = last_step_price.squeeze(1) # [B, D]
+        # 2. Learnable query attention (original)
+        h_orig, _ = self.attn_orig(query, orig_seq, orig_seq)
+        h_orig = h_orig.squeeze(1)
         
-        combined = torch.cat([context, last_step_flat], dim=-1) # [B, 2D]
+        # 3. [NEW] Price context from ALL timesteps
+        price_flat = orig_seq.reshape(B, -1)  # (B, T*D)
+        price_context = self.price_context(price_flat)  # (B, D)
         
-        # 4. Classify
+        # 4. Combine all three
+        combined = torch.cat([h_fused, h_orig, price_context], dim=-1)
+        
+        # 5. Classify
         logits = self.classifier(combined)
         
         return logits

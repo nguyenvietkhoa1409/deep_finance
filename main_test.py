@@ -1,139 +1,169 @@
-import os
-import pandas as pd
+"""
+scripts/verify_kg_fix.py
+
+Verify that the regenerated KG embeddings are not all zeros.
+"""
+
+import pickle
+import numpy as np
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
+
 from configs.config import GlobalConfig
-from data_pipeline.fetchers.yahoo_fetcher import YahooFetcher
-from data_pipeline.processors.price_processor import PriceProcessor
-from data_pipeline.processors.macro_processor import MacroProcessor
-from data_pipeline.processors.news_processor import NewsProcessor, NewsEmbedder
-from data_pipeline.builder import DatasetBuilder
 
-def run_test_pipeline_skipping_news_fetch():
-    print("🚀 STARTING TEST PIPELINE (Skipping News Fetching)...")
 
-    # --- SETUP PATHS ---
-    # Đường dẫn đến file kết quả cũ bạn đã có
-    # LƯU Ý: Đảm bảo file này nằm đúng vị trí hoặc bạn sửa đường dẫn tại đây
-    EXISTING_NEWS_PATH = os.path.join(GlobalConfig.INTERIM_PATH, "concatenated_news_filtered.parquet")
+def verify_embeddings(kg_path):
+    """
+    Quick verification of embedding quality
+    """
+    print("="*80)
+    print("🔍 VERIFYING REGENERATED KG EMBEDDINGS")
+    print("="*80)
     
-    if not os.path.exists(EXISTING_NEWS_PATH):
-        print(f"❌ ERROR: Không tìm thấy file tại {EXISTING_NEWS_PATH}")
-        print("   Vui lòng copy file 'concatenated_news_filtered.parquet' vào thư mục 'data/interim/' hoặc cập nhật đường dẫn.")
-        return
-
-    # ==============================================================================
-    # 1. Fetching Phase (Chỉ lấy Price & Macro, BỎ QUA News Fetcher)
-    # ==============================================================================
-    print("\n--- Phase A: Fetching (Price & Macro only) ---")
-    yahoo = YahooFetcher()
+    # Load
+    print(f"\n📂 Loading from {kg_path}...")
+    with open(kg_path, 'rb') as f:
+        kg_data = pickle.load(f)
+    print(f"   ✓ Loaded {len(kg_data)} dates")
     
-    # Tạo thư mục nếu chưa có
-    os.makedirs(GlobalConfig.RAW_PRICE_PATH, exist_ok=True)
-    os.makedirs(GlobalConfig.RAW_MACRO_PATH, exist_ok=True)
-    os.makedirs(GlobalConfig.PROCESSED_PATH, exist_ok=True)
-
-    # 1.1 Lấy dữ liệu giá (Làm xương sống cho trục thời gian)
-    print(f"   Downloading Price Data ({GlobalConfig.START_DATE} to {GlobalConfig.END_DATE})...")
-    raw_price_list = yahoo.download_data(GlobalConfig.START_DATE, GlobalConfig.END_DATE, GlobalConfig.TICKERS)
+    # Sample first non-empty graph
+    print("\n🔬 Sampling first non-empty graph...")
     
-    # 1.2 Lấy dữ liệu Vĩ mô
-    print("   Downloading Macro Indicators...")
-    raw_macro = yahoo.fetch_macro_indicators(GlobalConfig.START_DATE, GlobalConfig.END_DATE, GlobalConfig.MACRO_SYMBOLS)
-
-    # ==============================================================================
-    # 2. Processing Phase (Load News có sẵn -> Align -> Embed)
-    # ==============================================================================
-    print("\n--- Phase B: Processing ---")
-    price_proc = PriceProcessor()
-    macro_proc = MacroProcessor()
-    news_proc = NewsProcessor()
-
-    # 2.1 Xử lý Price & Macro
-    print("   Processing Price & Macro...")
-    price_dict = price_proc.combine_to_nested_dict(raw_price_list, GlobalConfig.TICKERS)
-    processed_price_macro = macro_proc.process_and_enrich(price_dict, raw_macro)
+    sample_graph = None
+    for date, ticker_graphs in kg_data.items():
+        for ticker, graph in ticker_graphs.items():
+            if graph['event'].x.size(0) > 0:
+                sample_graph = graph
+                print(f"   ✓ Found: {ticker} on {date}")
+                break
+        if sample_graph:
+            break
     
-    # Lấy danh sách ngày giao dịch chuẩn (Trading Days Backbone)
-    trading_dates = list(processed_price_macro.keys())
-    print(f"   Detected {len(trading_dates)} trading days.")
-
-    # 2.2 Load Existing News
-    print(f"   📥 Loading existing news from: {EXISTING_NEWS_PATH}")
-    try:
-        processed_news = pd.read_parquet(EXISTING_NEWS_PATH)
-        print(f"   Loaded {len(processed_news)} news records.")
-        
-        # [ANNOTATION 1] Kiểm tra Schema
-        required_cols = ['date', 'equity', 'title'] # Các cột bắt buộc cho bước sau
-        missing_cols = [c for c in required_cols if c not in processed_news.columns]
-        if missing_cols:
-            print(f"   ⚠️ WARNING: File parquet thiếu các cột: {missing_cols}")
-            print("   Logic cũ có thể dùng tên khác (ví dụ: 'headline' thay vì 'title'). Đang thử tự động sửa...")
-            if 'headline' in processed_news.columns and 'title' not in processed_news.columns:
-                processed_news = processed_news.rename(columns={'headline': 'title'})
-                print("   ✅ Renamed 'headline' -> 'title'.")
-            
-            # Kiểm tra lại cột date phải là datetime
-            if not pd.api.types.is_datetime64_any_dtype(processed_news['date']):
-                 processed_news['date'] = pd.to_datetime(processed_news['date']).dt.date
+    if not sample_graph:
+        print("   ❌ No non-empty graphs found!")
+        return False
     
-    except Exception as e:
-        print(f"❌ ERROR reading parquet file: {e}")
-        return
-
-    # 2.3 Align News to Trading Days
-    # Bước này vẫn CẦN THIẾT vì Price Data mới tải về có thể có ngày nghỉ lễ khác hoặc range khác
-    print("   Aligning news to current Trading Days...")
-    aligned_news = news_proc.align_to_trading_days(processed_news, trading_dates)
-    print(f"   News after alignment: {len(aligned_news)} records.")
-
-    # ==============================================================================
-    # 3. Embedding Phase (Chạy Embedding trên dữ liệu đã load)
-    # ==============================================================================
-    print("\n--- Phase B.1: Embedding News ---")
+    # Extract features
+    event_features = sample_graph['event'].x.cpu().numpy()
     
-    # [ANNOTATION 2] Kiểm tra file embedding cũ
-    embedder = NewsEmbedder()
-    embedding_output_file = os.path.join(GlobalConfig.NEWS_EMBEDDING_OUTPUT_PATH, "embedded_news.json")
+    print(f"\n📊 Feature Statistics:")
+    print(f"   Shape: {event_features.shape}")
+    print(f"   Total dims: {event_features.shape[1]}")
     
-    if os.path.exists(embedding_output_file):
-        print(f"   ⚠️ File embedding đã tồn tại: {embedding_output_file}")
-        user_input = input("   Bạn có muốn chạy lại Embedding (tốn tiền/thời gian) không? (y/n): ")
-        if user_input.lower() == 'y':
-            embedding_json_path = embedder.process_and_save(aligned_news)
-        else:
-            print("   Skipping Embedding calculation. Using existing file.")
-            embedding_json_path = embedding_output_file
+    # Check structured vs semantic
+    STRUCTURED_END = 1037
+    SEMANTIC_START = 1037
+    
+    structured = event_features[:, :STRUCTURED_END]
+    semantic = event_features[:, SEMANTIC_START:]
+    
+    print(f"\n   📈 Structured part (0-1036):")
+    print(f"      Mean:   {structured.mean():.6f}")
+    print(f"      Std:    {structured.std():.6f}")
+    print(f"      Zeros:  {np.mean(structured == 0)*100:.2f}%")
+    
+    print(f"\n   🎯 Semantic part (1037-1804):")
+    print(f"      Mean:   {semantic.mean():.6f}")
+    print(f"      Std:    {semantic.std():.6f}")
+    print(f"      Zeros:  {np.mean(semantic == 0)*100:.2f}%")
+    
+    # === CRITICAL CHECK ===
+    semantic_all_zeros = np.allclose(semantic, 0)
+    
+    print("\n" + "="*80)
+    if semantic_all_zeros:
+        print("❌ SEMANTIC EMBEDDINGS STILL ALL ZEROS!")
+        print("="*80)
+        print("\n   Voyage API embedding FAILED AGAIN")
+        print("\n   Next steps:")
+        print("      1. Check Voyage API key validity")
+        print("      2. Check API logs for errors")
+        print("      3. Try Option B: Use sentence-transformers")
+        return False
     else:
-        # Nếu chưa có file thì chạy mới
-        embedding_json_path = embedder.process_and_save(aligned_news)
+        print("✅ SEMANTIC EMBEDDINGS SUCCESSFULLY POPULATED!")
+        print("="*80)
+        print(f"\n   Mean: {semantic.mean():.6f} (should be ~0)")
+        print(f"   Std:  {semantic.std():.6f} (should be >0)")
+        print(f"   Non-zero: {np.sum(semantic != 0)}/{semantic.size} values")
+        
+        # Sample values
+        print(f"\n   Sample semantic values (first event, first 10 dims):")
+        print(f"      {semantic[0, :10]}")
+        
+        return True
 
-    # ==============================================================================
-    # 4. Building Phase (Tạo file Union cuối cùng)
-    # ==============================================================================
-    print("\n--- Phase C: Building Union File ---")
-    builder = DatasetBuilder()
-    
-    # Giả định file Filings đã có (hoặc bỏ qua nếu chưa cần test filings)
-    filing_path = os.path.join(GlobalConfig.RAW_FILINGS_PATH, "final_summary_filing_data.parquet")
-    if not os.path.exists(filing_path):
-        print(f"   ⚠️ Warning: Filing file not found at {filing_path}. Creating dataset without filings.")
-        # Tạo dummy empty dataframe để code không lỗi
-        pd.DataFrame(columns=['filedAt', 'ticker', 'formType', 'content_summary']).to_parquet("dummy_filings.parquet")
-        filing_path = "dummy_filings.parquet"
 
-    dataset = builder.create_synchronized_data(
-        processed_price_macro, 
-        aligned_news, 
-        filing_path,
-        embedding_path=embedding_json_path
-    )
+def compare_before_after(old_path, new_path):
+    """
+    Compare old (broken) vs new (hopefully fixed) embeddings
+    """
+    print("\n" + "="*80)
+    print("📊 BEFORE vs AFTER COMPARISON")
+    print("="*80)
     
-    builder.save(dataset, filename='unified_dataset_test.pkl')
+    # Load both
+    try:
+        with open(old_path, 'rb') as f:
+            old_data = pickle.load(f)
+        print(f"\n   ✓ Loaded OLD: {old_path}")
+    except:
+        print(f"\n   ⚠️  OLD file not found (OK if deleted)")
+        old_data = None
     
-    # Xóa file dummy nếu có
-    if os.path.exists("dummy_filings.parquet"): os.remove("dummy_filings.parquet")
+    with open(new_path, 'rb') as f:
+        new_data = pickle.load(f)
+    print(f"   ✓ Loaded NEW: {new_path}")
     
-    print("\n✅ TEST PIPELINE COMPLETED SUCCESSFULLY!")
+    # Compare
+    if old_data:
+        # Sample same graph
+        date = list(new_data.keys())[0]
+        ticker = list(new_data[date].keys())[0]
+        
+        old_graph = old_data[date][ticker]
+        new_graph = new_data[date][ticker]
+        
+        old_semantic = old_graph['event'].x[:, 1037:].cpu().numpy()
+        new_semantic = new_graph['event'].x[:, 1037:].cpu().numpy()
+        
+        print(f"\n   OLD semantic embeddings:")
+        print(f"      Mean: {old_semantic.mean():.6f}")
+        print(f"      Std:  {old_semantic.std():.6f}")
+        print(f"      Zeros: {np.mean(old_semantic == 0)*100:.1f}%")
+        
+        print(f"\n   NEW semantic embeddings:")
+        print(f"      Mean: {new_semantic.mean():.6f}")
+        print(f"      Std:  {new_semantic.std():.6f}")
+        print(f"      Zeros: {np.mean(new_semantic == 0)*100:.1f}%")
+        
+        if np.allclose(old_semantic, new_semantic):
+            print("\n   ⚠️  WARNING: Embeddings are IDENTICAL (not regenerated?)")
+        else:
+            print("\n   ✅ Embeddings are DIFFERENT (successfully regenerated)")
+
 
 if __name__ == "__main__":
-    run_test_pipeline_skipping_news_fetch()
+    kg_path = "data/interim/kg_cache/hetero_kg_graphs.pkl"
+    
+    success = verify_embeddings(kg_path)
+    
+    # Try comparison if old backup exists
+    old_path = "data/interim/kg_cache/hetero_kg_graphs.pkl.backup"
+    if Path(old_path).exists():
+        compare_before_after(old_path, kg_path)
+    
+    print("\n" + "="*80)
+    if success:
+        print("✅ VERIFICATION PASSED - PROCEED TO TRAINING")
+        print("="*80)
+        print("\nNext step:")
+        print("   python main.py")
+    else:
+        print("❌ VERIFICATION FAILED - DO NOT TRAIN YET")
+        print("="*80)
+        print("\nNext step:")
+        print("   1. Check setup_hybrid_kg.py logs for Voyage errors")
+        print("   2. Or use sentence-transformers fallback")

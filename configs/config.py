@@ -93,7 +93,7 @@ class TrainConfig:
     num_head = 2
     
     # training
-    epoch_num = 300
+    epoch_num = 200
     # learning_rate = 1e-4
     learning_rate = 1e-4
     weight_decay = 1e-4
@@ -105,8 +105,8 @@ class TrainConfig:
     
     # ============================================
     # NEW: Knowledge Graph Settings
-    # ============================================
-    use_kg = True  # Enable/disable KG module
+    # ============================================s
+    use_kg = False  # Enable/disable KG module
     kg_graph_path = os.path.join(
         GlobalConfig.KG_CACHE_DIR,
         'hetero_kg_graphs.pkl'
