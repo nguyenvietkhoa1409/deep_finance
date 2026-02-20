@@ -225,7 +225,7 @@ class StockMovementModel(nn.Module):
             # [UPDATED] Use heterogeneous encoder
             self.kg_encoder = HeteroKGSequenceEncoder(
                 ticker_input_dim=1028,      # Ticker node dim
-                event_input_dim=1805,       # Hybrid event node dim
+                event_input_dim=2061,       # Hybrid event node dim
                 hidden_dim=256,             # Increased for richer features
                 output_dim=dim,             # Must match MSGCA dim (128)
                 num_heads=4,

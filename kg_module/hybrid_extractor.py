@@ -463,16 +463,11 @@ class HybridTripleExtractor:
                     
                     # Path B: Semantic features
                     triple_text = f"{triple[0]} {triple[1]} {triple[2]}"
-                    triple_emb = triple_embeddings.get(
+                    f_sem = triple_embeddings.get(
                         triple_text,
                         np.zeros(1024, dtype=np.float32)
                     )
-                    
-                    # Concatenate [doc_emb; triple_emb] → project to 768
-                    ctx_emb = np.concatenate([doc_emb, triple_emb])
-                    f_sem = ctx_emb[:768]  # Simplified projection
-                    
-                    # Hybrid
+                    # Hybrid (1037 + 1024 = 2061-dim)
                     f_hybrid = np.concatenate([f_struct, f_sem])
                     features.append(f_hybrid)
                     
@@ -494,3 +489,55 @@ class HybridTripleExtractor:
         print(f"   Cache hit rate: {self.stats['cache_hits'] / len(unique_triples) * 100:.1f}%")
         
         return results
+
+    # kg_module/hybrid_extractor.py - ADD ERROR HANDLING
+
+    def _safe_embed_with_retry(self, texts, max_retries=3):
+        """
+        Embed with proper error handling and logging
+        """
+        for attempt in range(max_retries):
+            try:
+                print(f"   Attempt {attempt+1}: Embedding {len(texts)} texts...")
+                
+                result = self.client.embed(
+                    texts=texts,
+                    model=self.model,
+                    input_type='document'
+                )
+                
+                # CRITICAL: Check if result is valid
+                if result is None:
+                    print(f"   ⚠️  Voyage returned None!")
+                    raise ValueError("API returned None")
+                
+                if not hasattr(result, 'embeddings') or not result.embeddings:
+                    print(f"   ⚠️  Voyage returned empty embeddings!")
+                    raise ValueError("API returned empty")
+                
+                # CRITICAL: Check embedding dimension
+                if len(result.embeddings[0]) != 1024:
+                    print(f"   ⚠️  Wrong dimension: {len(result.embeddings[0])}")
+                    raise ValueError(f"Wrong dimension")
+                
+                # SUCCESS
+                embeddings = [np.array(emb, dtype=np.float32) for emb in result.embeddings]
+                
+                # Verify not all zeros
+                if all(np.allclose(emb, 0) for emb in embeddings):
+                    print(f"   ⚠️  All embeddings are zeros!")
+                    raise ValueError("All zeros")
+                
+                print(f"   ✓ Successfully embedded {len(texts)} texts")
+                return embeddings
+                
+            except Exception as e:
+                print(f"   ❌ Attempt {attempt+1} failed: {e}")
+                
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"   Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"   🔴 All retries exhausted!")
+                    raise RuntimeError(f"Embedding failed after {max_retries} attempts: {e}")

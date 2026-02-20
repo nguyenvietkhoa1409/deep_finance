@@ -32,7 +32,7 @@ class HeteroKGEncoder(nn.Module):
     def __init__(
         self,
         ticker_input_dim: int = 1028,
-        event_input_dim: int = 1805,
+        event_input_dim: int = 2061,
         hidden_dim: int = 256,
         output_dim: int = 128,
         num_heads: int = 4,
@@ -207,7 +207,7 @@ class HeteroKGSequenceEncoder(nn.Module):
     def __init__(
         self,
         ticker_input_dim: int = 1028,
-        event_input_dim: int = 1805,
+        event_input_dim: int = 2061,
         hidden_dim: int = 512,
         output_dim: int = 256,
         num_heads: int = 4,

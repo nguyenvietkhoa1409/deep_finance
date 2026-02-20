@@ -106,7 +106,7 @@ class TrainConfig:
     # ============================================
     # NEW: Knowledge Graph Settings
     # ============================================s
-    use_kg = False  # Enable/disable KG module
+    use_kg = True  # Enable/disable KG module
     kg_graph_path = os.path.join(
         GlobalConfig.KG_CACHE_DIR,
         'hetero_kg_graphs.pkl'

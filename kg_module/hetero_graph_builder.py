@@ -1,6 +1,6 @@
 """
 Heterogeneous Graph Builder for Hybrid KG
-Supports ticker nodes (1028-dim) + event nodes (1805-dim)
+Supports ticker nodes (1028-dim) + event nodes (2061-dim)
 [FIXED] Metadata attribute names to avoid conflicts
 """
 
@@ -119,7 +119,7 @@ class HeteroGraphBuilder:
             self.stats['total_event_nodes'] += N_events
         else:
             # Empty graph: only ticker node
-            graph['event'].x = torch.zeros((0, 1805), dtype=torch.float32)
+            graph['event'].x = torch.zeros((0, 2061), dtype=torch.float32)
             graph['ticker', 'has_event', 'event'].edge_index = torch.zeros((2, 0), dtype=torch.long)
             graph['event', 'affects', 'ticker'].edge_index = torch.zeros((2, 0), dtype=torch.long)
             
