@@ -61,14 +61,18 @@ class HeteroKGEncoder(nn.Module):
             nn.Linear(ticker_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(0.2)
         )
         
         self.event_proj = nn.Sequential(
-            nn.Linear(event_input_dim, hidden_dim),
+            nn.Linear(event_input_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.2),  # Dropout cực mạnh (50%) để triệt tiêu overfit
+            nn.Linear(512, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(0.2)   # Dropout cực mạnh lần 2
         )
         
         # === Heterogeneous Convolution Layer 1 ===

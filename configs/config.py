@@ -78,7 +78,7 @@ class TrainConfig:
     # data
     train_ratio = 0.70  # 70% để học
     valid_ratio = 0.15  # 15% để tinh chỉnh (chọn best model)
-    batch_size = 64
+    batch_size = 32
 
     # Window Size (T): Số ngày quá khứ dùng để dự báo.
     window_size = 20
@@ -93,20 +93,20 @@ class TrainConfig:
     num_head = 2
     
     # training
-    epoch_num = 200
+    epoch_num = 250
     # learning_rate = 1e-4
     learning_rate = 1e-4
     weight_decay = 1e-4
     drop_out = 0.2
     
     # Loss Strategy
-    use_focal_loss = False # TẮT FOCAL LOSS
+    use_focal_loss = False
     label_smoothing = 0.1  # Bật Label Smoothing
     
     # ============================================
     # NEW: Knowledge Graph Settings
     # ============================================s
-    use_kg = True  # Enable/disable KG module
+    use_kg = False  # Enable/disable KG module
     kg_graph_path = os.path.join(
         GlobalConfig.KG_CACHE_DIR,
         'hetero_kg_graphs.pkl'

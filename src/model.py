@@ -1,36 +1,47 @@
-# # FILE: src/model.py
+# # # FILE: src/model.py
 
+import torch
+from torch import nn
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == 'mean': return focal_loss.mean()
+        elif self.reduction == 'sum': return focal_loss.sum()
+        else: return focal_loss
+
+
+# # FILE: src/model.py
 # import torch
 # from torch import nn
 # from sklearn.metrics import accuracy_score, matthews_corrcoef
 # import torch.nn.functional as F
+
 # from encoders.mutil_encoder import MultimodalSourceEncoding
 # from .fusion import StableGatedCrossAttention
 # from .predictor import FinegrainedMovementPrediction
-# # Import KG Encoder nếu có
+# from configs.config import TrainConfig
+
+# # Import KG Encoder an toàn
 # try:
-#     from encoders.kg_encoder import KnowledgeGraphEncoder
+#     from encoders.hetero_kg_encoder import HeteroKGSequenceEncoder
 # except ImportError:
 #     pass
 
-# from configs.config import TrainConfig
-
-# class FocalLoss(nn.Module):
-#     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-#         super(FocalLoss, self).__init__()
-#         self.gamma = gamma
-#         self.alpha = alpha
-#         self.reduction = reduction
-
-#     def forward(self, inputs, targets):
-#         ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
-#         pt = torch.exp(-ce_loss)
-#         focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-#         if self.reduction == 'mean': return focal_loss.mean()
-#         elif self.reduction == 'sum': return focal_loss.sum()
-#         else: return focal_loss
-
 # class StockMovementModel(nn.Module):
+#     """
+#     MSGCA Framework - Optimized Sequential Fusion (Re-ordered).
+    
+#     NEW ORDER: Price -> News -> Macro -> KG
+#     REASON: Fuse High-Frequency Data (News) first, then Low-Frequency (Macro).
+#     """
 #     def __init__(
 #         self,
 #         price_dim,
@@ -43,102 +54,92 @@
 #         device, 
 #         dropout=0.1, 
 #         class_weights=None,
-#         use_focal_loss=True,
-#         use_kg=False,  # [NEW] Flag bật KG
+#         use_focal_loss=True, 
+#         use_kg=True,
+#         label_smoothing = TrainConfig.label_smoothing
 #     ):
 #         super().__init__()
 #         self.device = device
 #         self.use_kg = use_kg
-
+#         self.label_smoothing = label_smoothing
 #         # 1. Encoders
 #         self.multimodal_encoder = MultimodalSourceEncoding(
 #             price_dim=price_dim, macro_dim=macro_dim, news_dim=news_dim, dim=dim
 #         )
         
-#         # [NEW] KG Encoder
 #         if self.use_kg:
-#             # Đảm bảo import đúng
-#             from encoders.kg_encoder import KnowledgeGraphEncoder
-#             self.kg_encoder = KnowledgeGraphEncoder(
-#                 input_dim=getattr(TrainConfig, 'kg_input_dim', 772),
-#                 hidden_dim=getattr(TrainConfig, 'kg_hidden_dim', 128),
-#                 output_dim=getattr(TrainConfig, 'kg_output_dim', dim),
-#                 dropout=getattr(TrainConfig, 'kg_dropout', 0.1)
+#             # [UPDATED] Use heterogeneous encoder
+#             self.kg_encoder = HeteroKGSequenceEncoder(
+#                 ticker_input_dim=1028,      # Ticker node dim
+#                 event_input_dim=2061,       # Hybrid event node dim
+#                 hidden_dim=256,             # Increased for richer features
+#                 output_dim=dim,             # Must match MSGCA dim (128)
+#                 num_heads=4,
+#                 dropout=dropout
 #             )
-#             self.fusion_kg = StableGatedCrossAttention(dim=dim, num_head=num_head)
-#             print("🕸️  Knowledge Graph Module: ENABLED")
+#             print("🕸️  Heterogeneous KG Module: ENABLED")
 
-#         # 2. Fusion
-#         self.fusion_news = StableGatedCrossAttention(dim=dim, num_head=num_head)
-#         self.fusion_macro = StableGatedCrossAttention(dim=dim, num_head=num_head)
+#         # 2. Sequential Fusion Modules (Re-ordered)
+#         self.fuse_with_news = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         
+#         self.fuse_with_macro = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+        
+#         # Bước 3: Context & KG (Giữ nguyên vị trí cuối)
+#         if self.use_kg:
+#             self.fuse_with_kg = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+            
 #         # 3. Predictor
 #         self.movement_predictor = FinegrainedMovementPrediction(
 #             dim=dim, window_size=input_dim, num_classes=output_dim, dropout=dropout
-#         )
-
-#         # 4. Loss
+#         )   
+            
+#         # 4. Loss Function
 #         if use_focal_loss:
-#             self.loss_fn = FocalLoss(alpha=class_weights, gamma=2.0)
-#             print("🔧 Loss Strategy: FOCAL LOSS")
+#             # Ưu tiên Focal Loss với Gamma = 3.0
+#             self.loss_fn = FocalLoss(alpha=class_weights, gamma=3.0)
+#             print("🔧 Loss Strategy: FOCAL LOSS (Gamma=3.0)")
 #         else:
-#             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+#             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+#             print(f"🔧 Loss Strategy: CrossEntropy with Label Smoothing={label_smoothing}")
+            
 
-#     # [CRITICAL FIX] Thêm s_kg=None vào signature
 #     def forward(self, s_o, s_h, s_c, s_m, s_n, s_kg=None, label=None, mode="train"):
-#         # 1. Encode Features
-#         v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
-
-#         # 2. Fusion
-#         fused_news = self.fusion_news(primary=v_i, aux=v_n)
-#         fused_macro = self.fusion_macro(primary=v_i, aux=v_m)
+#         # --- 1. Encoding ---
+#         v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)  
+#         # --- 2. Sequential Fusion (Re-ordered + Residual Anchor) ---
+#         fused_1 = self.fuse_with_news(stable=v_i, unstable=v_n)  # Price dẫn dắt News
+#         fused_2 = self.fuse_with_macro(stable=fused_1, unstable=v_m)  # Price+News dẫn dắt Macro
         
-#         v_fused_total = (fused_news + fused_macro) / 2.0
-
-#         # [NEW] KG Integration
 #         if self.use_kg and s_kg is not None:
-#             # Check s_kg valid (list of list of Data)
-#             if isinstance(s_kg, list) and len(s_kg) > 0:
-#                 v_kg = self.kg_encoder(s_kg) # (B, T, dim)
-#                 v_kg = v_kg.to(v_i.device)
-                
-#                 fused_kg = self.fusion_kg(primary=v_i, aux=v_kg)
-#                 # Average 3 modalities
-#                 v_fused_total = (fused_news + fused_macro + fused_kg) / 3.0
-
-#         # 3. Predict
-#         logits = self.movement_predictor(fused_seq=v_fused_total, orig_seq=v_i)
+#             v_kg = self.kg_encoder(s_kg)
+#             v_kg = v_kg.to(v_i.device)
+#             stable_for_kg = fused_2 + v_i  # "Neo" bằng Price gốc trước khi vào KG
+#             fused_final = self.fuse_with_kg(stable=stable_for_kg, unstable=v_kg)  # Price+News+Macro dẫn dắt KG
+#         else:
+#             fused_final = fused_2  # Nếu không dùng KG, lấy kết quả sau Macro fusion
+#         # --- 3. Prediction ---
+#         logits = self.movement_predictor(fused_seq=fused_final, orig_seq=v_i)
 #         logits = torch.clamp(logits, -15, 15)
 
+#         # --- 4. Return Output ---
 #         if mode == "train":
-#             if label is None:
-#                 raise ValueError("Label cannot be None in train mode")
-            
-#             if isinstance(label, list):
-#                 target = torch.tensor([item[0] for item in label], dtype=torch.long, device=self.device)
-#             else:
-#                 target = label.long().to(self.device)
-            
-#             loss = self.loss_fn(logits, target)
-#             return loss
+#             if label is None: raise ValueError("Label is None in train mode")
+#             target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], device=self.device)
+#             target = target.long().to(self.device)
+#             return self.loss_fn(logits, target)
 
 #         elif mode == "test":
-#             if label is not None:
-#                 if isinstance(label, list):
-#                     target = torch.tensor([item[0] for item in label], dtype=torch.long, device=self.device)
-#                 else:
-#                     target = label.long().to(self.device)
-#                 preds = torch.argmax(logits, dim=1)
-#                 acc = accuracy_score(target.cpu().numpy(), preds.cpu().numpy())
-#                 mcc = matthews_corrcoef(target.cpu().numpy(), preds.cpu().numpy())
-#                 return acc, mcc
-#             return 0.0, 0.0
+#             target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], device=self.device)
+#             target = target.long().to(self.device)
+#             preds = torch.argmax(logits, dim=1)
+#             acc = accuracy_score(target.cpu().numpy(), preds.cpu().numpy())
+#             mcc = matthews_corrcoef(target.cpu().numpy(), preds.cpu().numpy())
+#             return acc, mcc
             
 #         elif mode == "inference":
 #             return logits
 
 
-# FILE: src/model.py
 import torch
 from torch import nn
 from sklearn.metrics import accuracy_score, matthews_corrcoef
@@ -149,103 +150,39 @@ from .fusion import StableGatedCrossAttention
 from .predictor import FinegrainedMovementPrediction
 from configs.config import TrainConfig
 
-# Import KG Encoder an toàn
-try:
-    from encoders.hetero_kg_encoder import KnowledgeGraphEncoder
-except ImportError:
-    pass
-
-# FILE: src/model.py
-import torch
-from torch import nn
-from sklearn.metrics import accuracy_score, matthews_corrcoef
-import torch.nn.functional as F
-
-from encoders.mutil_encoder import MultimodalSourceEncoding
-from .fusion import StableGatedCrossAttention
-from .predictor import FinegrainedMovementPrediction
-from configs.config import TrainConfig
-
-# Import KG Encoder an toàn
-try:
-    from encoders.hetero_kg_encoder import KnowledgeGraphEncoder
-except ImportError:
-    pass
-
-# FILE: src/model.py
-import torch
-from torch import nn
-from sklearn.metrics import accuracy_score, matthews_corrcoef
-import torch.nn.functional as F
-
-from encoders.mutil_encoder import MultimodalSourceEncoding
-from .fusion import StableGatedCrossAttention
-from .predictor import FinegrainedMovementPrediction
-from configs.config import TrainConfig
-
-# Import KG Encoder an toàn
 try:
     from encoders.hetero_kg_encoder import HeteroKGSequenceEncoder
 except ImportError:
     pass
 
 class StockMovementModel(nn.Module):
-    """
-    MSGCA Framework - Optimized Sequential Fusion (Re-ordered).
-    
-    NEW ORDER: Price -> News -> Macro -> KG
-    REASON: Fuse High-Frequency Data (News) first, then Low-Frequency (Macro).
-    """
     def __init__(
-        self,
-        price_dim,
-        macro_dim,
-        news_dim,
-        dim,
-        input_dim,
-        output_dim,
-        num_head,
-        device, 
-        dropout=0.1, 
-        class_weights=None,
-        use_focal_loss=False, 
-        use_kg=True,
-        label_smoothing = TrainConfig.label_smoothing
+        self, price_dim, macro_dim, news_dim, dim, input_dim, output_dim,
+        num_head, device, dropout=0.1, class_weights=None,use_focal_loss=True, use_kg=True
     ):
         super().__init__()
         self.device = device
         self.use_kg = use_kg
-        self.label_smoothing = label_smoothing
+        self.label_smoothing = getattr(TrainConfig, 'label_smoothing', 0.1)
+
         # 1. Encoders
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim, macro_dim=macro_dim, news_dim=news_dim, dim=dim
         )
         
         if self.use_kg:
-            # [UPDATED] Use heterogeneous encoder
             self.kg_encoder = HeteroKGSequenceEncoder(
-                ticker_input_dim=1028,      # Ticker node dim
-                event_input_dim=2061,       # Hybrid event node dim
-                hidden_dim=256,             # Increased for richer features
-                output_dim=dim,             # Must match MSGCA dim (128)
-                num_heads=4,
-                dropout=dropout
+                ticker_input_dim=1028, event_input_dim=2061,
+                hidden_dim=256, output_dim=dim, num_heads=4, dropout=dropout
             )
             print("🕸️  Heterogeneous KG Module: ENABLED")
 
-        # 2. Sequential Fusion Modules (Re-ordered)
-        
-        # [MODIFIED] Bước 1: Price & News (Thay vì Macro)
-        # News biến động nhanh, tương quan cao với Price -> Fuse trước
-        self.fusion_price_news = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
-        
-        # [MODIFIED] Bước 2: Context & Macro
-        # Macro là xu hướng dài hạn, đóng vai trò điều chỉnh Context
-        self.fusion_with_macro = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
-        
-        # Bước 3: Context & KG (Giữ nguyên vị trí cuối)
+        # 2. Parallel-Anchored Sequential Fusion Modules
+        # Chú ý: Cấu trúc đã được làm sạch, giữ nguyên số lượng tham số
+        self.fusion_news = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+        self.fusion_macro = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         if self.use_kg:
-            self.fusion_with_kg = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
+            self.fusion_kg = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
 
         # 3. Predictor
         self.movement_predictor = FinegrainedMovementPrediction(
@@ -253,72 +190,53 @@ class StockMovementModel(nn.Module):
         )
 
         # 4. Loss Function
-        self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
-        print(f"🔧 Loss Strategy: CrossEntropy with Label Smoothing={label_smoothing}")
+        if use_focal_loss:
+            # Ưu tiên Focal Loss với Gamma = 3.0
+            self.loss_fn = FocalLoss(alpha=class_weights, gamma=3.0)
+            print("🔧 Loss Strategy: FOCAL LOSS (Gamma=3.0)")
+        else:
+            self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=self.label_smoothing)
+            print(f"🔧 Loss Strategy: CrossEntropy with Label Smoothing={self.label_smoothing}")
 
     def forward(self, s_o, s_h, s_c, s_m, s_n, s_kg=None, label=None, mode="train"):
         # --- 1. Encoding ---
-        # v_i: Price (Indicator) - Stable Anchor
-        # v_n: News (Unstable 1)
-        # v_m: Macro (Unstable 2)
         v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
 
-        # --- 2. Sequential Fusion (Re-ordered + Residual Anchor) ---
+        # --- 2. Parallel-Anchored Fusion ---
+        # GIẢI PHÁP: Luôn dùng v_i (Price thuần) làm 'stable' (Query & Gate) để đánh giá.
+        # Điều này ngăn chặn nhiễu từ News làm mù Gate của Macro/KG.
         
-        # [STEP 1]: Price dẫn dắt News (Quan trọng nhất)
-        # Query = v_i (Price)
-        # Key/Value = v_n (News)
-        h_chain = self.fusion_price_news(stable=v_i, unstable=v_n)
+        # Bước 1: Khai thác News dựa trên Price
+        fused_news = self.fusion_news(stable=v_i, unstable=v_n)
         
-        # [STEP 2]: (Price + News) dẫn dắt Macro
-        # [CRITICAL FIX]: Cộng lại v_i (Price) để "neo" tín hiệu.
-        # Nếu không cộng, h_chain có thể đã bị biến đổi quá xa so với Price gốc.
-        stable_for_macro = h_chain + v_i 
-        h_chain = self.fusion_with_macro(stable=stable_for_macro, unstable=v_m)
+        # Bước 2: Khai thác Macro dựa trên Price
+        fused_macro = self.fusion_macro(stable=v_i, unstable=v_m)
         
-        # [STEP 3]: (Price + News + Macro) dẫn dắt KG
-        if self.use_kg and s_kg is not None:
-            if isinstance(s_kg, list) and len(s_kg) > 0:
-                v_kg = self.kg_encoder(s_kg)
-                v_kg = v_kg.to(v_i.device)
-                
-                # Tiếp tục "neo" bằng v_i
-                stable_for_kg = h_chain + v_i
-                h_chain = self.fusion_with_kg(stable=stable_for_kg, unstable=v_kg)
+        # Bước 3: Khai thác KG dựa trên Price
+        fused_kg = 0
+        if self.use_kg and s_kg is not None and isinstance(s_kg, list) and len(s_kg) > 0:
+            v_kg = self.kg_encoder(s_kg).to(v_i.device)
+            fused_kg = self.fusion_kg(stable=v_i, unstable=v_kg)
+
+        # Tích hợp theo luồng (Additive Context)
+        # Bằng cách cộng dồn, tín hiệu Price (v_i) được củng cố dần qua từng lớp thông tin 
+        # mà không làm hỏng cơ chế Gating.
+        h_final = v_i + fused_news + fused_macro + fused_kg
 
         # --- 3. Prediction ---
-        # Predictor vẫn đối chiếu kết quả chuỗi (h_chain) với Price gốc (v_i)
-        logits = self.movement_predictor(fused_seq=h_chain, orig_seq=v_i)
+        logits = self.movement_predictor(fused_seq=h_final, orig_seq=v_i)
         
-        # v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
-        # # Sequential fusion WITHOUT intermediate residuals
-        # h1 = self.fusion_price_news(stable=v_i, unstable=v_n)
-        # h2 = self.fusion_with_macro(stable=h1, unstable=v_m)  # ← Remove + v_i
-        
-        # if self.use_kg and s_kg is not None:
-        #     v_kg = self.kg_encoder(s_kg)
-        #     h3 = self.fusion_with_kg(stable=h2, unstable=v_kg)  # ← Remove + v_i
-        # else:
-        #     h3 = h2
-        
-        # # Single residual at the end
-        # h_final = h3 + v_i  # ← Only here
-        
-        # logits = self.movement_predictor(fused_seq=h_final, orig_seq=v_i)
-        
-        # Clamp logits
-        logits = torch.clamp(logits, -15, 15)
+        # ĐÃ XÓA: torch.clamp(logits, -15, 15) -> Tránh làm chết Gradient!
 
         # --- 4. Return Output ---
         if mode == "train":
-            if label is None: raise ValueError("Label is None in train mode")
-            target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], device=self.device)
-            target = target.long().to(self.device)
-            return self.loss_fn(logits, target)
+            # KHUYẾN NGHỊ: Hãy di chuyển logic xử lý list này sang class Dataset
+            # Code dưới đây chỉ xử lý tạm thời để tránh lỗi.
+            target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], dtype=torch.long, device=self.device)
+            return self.loss_fn(logits, target.long().to(self.device))
 
         elif mode == "test":
-            target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], device=self.device)
-            target = target.long().to(self.device)
+            target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], dtype=torch.long, device=self.device)
             preds = torch.argmax(logits, dim=1)
             acc = accuracy_score(target.cpu().numpy(), preds.cpu().numpy())
             mcc = matthews_corrcoef(target.cpu().numpy(), preds.cpu().numpy())

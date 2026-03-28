@@ -163,20 +163,85 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# class StableGatedCrossAttention(nn.Module):
+#     """
+#     Cài đặt chính xác cơ chế 'Gated Cross-Feature Fusion' từ paper MSGCA.
+    
+#     Logic:
+#     1. Cross-Attention: Dùng 'stable' (Query) để khai thác thông tin từ 'unstable' (Key/Value).
+#        -> Tạo ra 'unstable_fused' features (H_l_id).
+#     2. Gating Mechanism: Dùng chính 'stable' feature để tạo ra Gate.
+#        -> Gate quyết định giữ lại bao nhiêu thông tin từ 'unstable_fused'.
+    
+#     Paper Equations (12-14) & (17-19):
+#         Ha = Linear(Attention_Out) + b
+#         Hb = Sigmoid(Linear(Stable_Feature) + c)
+#         Output = Ha * Hb
+#     """
+#     def __init__(self, dim, num_head, dropout=0.1):
+#         super().__init__()
+        
+#         # 1. Multi-Head Cross Attention
+#         self.mha = nn.MultiheadAttention(
+#             embed_dim=dim, 
+#             num_heads=num_head, 
+#             dropout=dropout, 
+#             batch_first=True
+#         )
+        
+#         # 2. Linear layers cho Gating mechanism
+#         # Wa trong Eq(13) / (18) - Biến đổi output của Attention
+#         self.linear_a = nn.Linear(dim, dim)
+        
+#         # Wb trong Eq(14) / (19) - Biến đổi Stable feature để tạo Gate
+#         self.linear_b = nn.Linear(dim, dim)
+#         nn.init.constant_(self.linear_b.bias, -2.0)
+        
+#         # Layer Norm để ổn định training (Thực tế nên có sau MHA)
+#         self.norm = nn.LayerNorm(dim)
+#         self.dropout = nn.Dropout(dropout)
+
+#     def forward(self, stable, unstable, mask=None):
+#         """
+#         Args:
+#             stable (Query): Vector đặc trưng ổn định (VD: Price hoặc Fused_Level_1) [B, T, D]
+#             unstable (Key/Value): Vector đặc trưng bổ sung (VD: News, KG) [B, T, D]
+#         """
+#         # --- Bước 1: Unstable Cross-Attention Fusion (Eq 10-11) ---
+#         # Query = Stable, Key/Value = Unstable
+#         attn_out, _ = self.mha(query=stable, key=unstable, value=unstable, key_padding_mask=mask)
+#         attn_out = self.dropout(attn_out)
+        
+#         # Residual connection & Norm (Chuẩn hóa Transformer)
+#         # Lưu ý: Paper không nói rõ Residual ở đây, nhưng đây là best practice. 
+#         # Tuy nhiên để bám sát logic Gating của paper, ta dùng output thuần của MHA cho vào Gate.
+#         h_unstable_fused = attn_out 
+
+#         # --- Bước 2: Stable Gated Feature Selection (Eq 12-14) ---
+        
+#         # Tính Ha (Eq 13): Biến đổi đặc trưng vừa fuse
+#         h_a = self.linear_a(h_unstable_fused) # [B, T, D]
+#         h_a = self.dropout(h_a)
+#         # Tính Hb (Eq 14): Tính Gate dựa trên Stable Feature gốc
+#         # Đây là mấu chốt: Stable feature quyết định cái gì được đi qua
+#         gate = torch.sigmoid(self.linear_b(stable)) # [B, T, D]
+        
+#         # Element-wise Product (Eq 12)
+#         h_final = h_a * gate
+        
+#         # Thêm LayerNorm cuối cùng để ổn định đầu ra
+#         h_final = self.norm(self.dropout(h_final))
+        
+#         return h_final
+
+
+import torch
+import torch.nn as nn
+
 class StableGatedCrossAttention(nn.Module):
     """
-    Cài đặt chính xác cơ chế 'Gated Cross-Feature Fusion' từ paper MSGCA.
-    
-    Logic:
-    1. Cross-Attention: Dùng 'stable' (Query) để khai thác thông tin từ 'unstable' (Key/Value).
-       -> Tạo ra 'unstable_fused' features (H_l_id).
-    2. Gating Mechanism: Dùng chính 'stable' feature để tạo ra Gate.
-       -> Gate quyết định giữ lại bao nhiêu thông tin từ 'unstable_fused'.
-    
-    Paper Equations (12-14) & (17-19):
-        Ha = Linear(Attention_Out) + b
-        Hb = Sigmoid(Linear(Stable_Feature) + c)
-        Output = Ha * Hb
+    Cải tiến Gated Cross-Feature Fusion cho dữ liệu Tài chính.
+    Bảo toàn tín hiệu Stable bằng Highway Connection và sử dụng Pre-Norm để ổn định gradients.
     """
     def __init__(self, dim, num_head, dropout=0.1):
         super().__init__()
@@ -190,57 +255,58 @@ class StableGatedCrossAttention(nn.Module):
         )
         
         # 2. Linear layers cho Gating mechanism
-        # Wa trong Eq(13) / (18) - Biến đổi output của Attention
         self.linear_a = nn.Linear(dim, dim)
-        
-        # Wb trong Eq(14) / (19) - Biến đổi Stable feature để tạo Gate
         self.linear_b = nn.Linear(dim, dim)
+        
+        # Khởi tạo bias âm (-2.0) giúp Gate đóng lúc ban đầu, hạn chế nhiễu từ Unstable features
         nn.init.constant_(self.linear_b.bias, -2.0)
         
-        # Layer Norm để ổn định training (Thực tế nên có sau MHA)
-        self.norm = nn.LayerNorm(dim)
+        # 3. Pre-Norm Layers (Best practice cho Transformer)
+        self.norm_stable = nn.LayerNorm(dim)
+        self.norm_unstable = nn.LayerNorm(dim)
+        
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, stable, unstable, mask=None):
+    def forward(self, stable, unstable, mask=None, is_causal=False):
         """
         Args:
-            stable (Query): Vector đặc trưng ổn định (VD: Price hoặc Fused_Level_1) [B, T, D]
-            unstable (Key/Value): Vector đặc trưng bổ sung (VD: News, KG) [B, T, D]
+            stable: (B, T, D) - Tín hiệu gốc mạnh (Price/Indicators)
+            unstable: (B, T, D) - Tín hiệu nhiễu/bổ trợ (News/Macro/KG)
+            mask: padding mask cho chuỗi
+            is_causal: Bắt buộc = True nếu sequence T là chuỗi thời gian (chống Lookahead bias)
         """
-        # --- Bước 1: Unstable Cross-Attention Fusion (Eq 10-11) ---
-        # Query = Stable, Key/Value = Unstable
-        attn_out, _ = self.mha(query=stable, key=unstable, value=unstable, key_padding_mask=mask)
-        attn_out = self.dropout(attn_out)
-        
-        # Residual connection & Norm (Chuẩn hóa Transformer)
-        # Lưu ý: Paper không nói rõ Residual ở đây, nhưng đây là best practice. 
-        # Tuy nhiên để bám sát logic Gating của paper, ta dùng output thuần của MHA cho vào Gate.
-        h_unstable_fused = attn_out 
+        # --- Bước 1: Pre-Norm ---
+        # Chuẩn hóa đầu vào trước khi đưa qua các phép biến đổi (giúp hội tụ nhanh hơn)
+        normed_stable = self.norm_stable(stable)
+        normed_unstable = self.norm_unstable(unstable)
 
-        # --- Bước 2: Stable Gated Feature Selection (Eq 12-14) ---
+        # --- Bước 2: Unstable Cross-Attention Fusion ---
+        # Dùng stable làm Query để "hỏi" thông tin từ unstable (Key/Value)
+        attn_out, _ = self.mha(
+            query=normed_stable, 
+            key=normed_unstable, 
+            value=normed_unstable, 
+            key_padding_mask=mask,
+            is_causal=is_causal # [Quan trọng trong Finance]
+        )
         
-        # Tính Ha (Eq 13): Biến đổi đặc trưng vừa fuse
-        h_a = self.linear_a(h_unstable_fused) # [B, T, D]
-        h_a = self.dropout(h_a)
-        # Tính Hb (Eq 14): Tính Gate dựa trên Stable Feature gốc
-        # Đây là mấu chốt: Stable feature quyết định cái gì được đi qua
-        gate = torch.sigmoid(self.linear_b(stable)) # [B, T, D]
+        # --- Bước 3: Tính toán Gating (Highway Connection) ---
+        # h_a: Feature mới từ Unstable (đã được Attention)
+        h_a = self.linear_a(self.dropout(attn_out)) 
         
-        # Element-wise Product (Eq 12)
-        h_final = h_a * gate
+        # gate: Tín hiệu quyết định (0 -> 1) dựa trên trạng thái Stable hiện tại
+        gate = torch.sigmoid(self.linear_b(normed_stable)) 
         
-        # Thêm LayerNorm cuối cùng để ổn định đầu ra
-        h_final = self.norm(self.dropout(h_final))
+        # --- Bước 4: Tích hợp Highway-style Fusion ---
+        # Gated New Info: Thông tin nhiễu chỉ được qua khi Gate mở
+        gated_new = h_a * gate
+        
+        # Gated Stable Info: Complementary gate (1 - gate) bảo vệ tín hiệu gốc
+        # Nếu gate mở (tin vào News), giảm trọng số Price. Nếu gate đóng, giữ nguyên Price.
+        gated_stable = stable * (1.0 - gate) 
+        
+        # Output kết hợp cả 2 luồng. Lưu ý: stable cộng vào là raw stable (chưa qua norm)
+        # để đảm bảo tính chất Residual đúng chuẩn.
+        h_final = gated_new + gated_stable
         
         return h_final
-        # attn_out, _ = self.mha(query=stable, key=unstable, value=unstable)
-        
-        # h_a = self.linear_a(attn_out)
-        # gate = torch.sigmoid(self.linear_b(stable))
-        
-        # # [FIX] Highway-style gating
-        # gated_new = h_a * gate
-        # gated_stable = stable * (1.0 - gate)  # Complementary
-        
-        # h_final = self.norm(gated_new + gated_stable)  # Both paths
-        # return h_final

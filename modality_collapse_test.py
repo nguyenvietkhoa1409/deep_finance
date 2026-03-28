@@ -4,7 +4,9 @@ import os
 import random
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import accuracy_score, matthews_corrcoef
 
 from src.model import StockMovementModel
 from src.data_loader import data_prepare
@@ -32,7 +34,6 @@ class StockDataset(Dataset):
         self.s_m = data_dict["s_m"]
         self.s_n = data_dict["s_n"]
         self.label = data_dict["label"]
-        # Load s_kg nếu có (có thể là Tensor hoặc List[HeteroData])
         self.s_kg = data_dict.get("s_kg")
 
     def __len__(self):
@@ -51,7 +52,6 @@ class StockDataset(Dataset):
             item["s_kg"] = self.s_kg[idx]
         return item
 
-# Custom Collate để xử lý cả Tensor và List of Graphs
 def collate_fn(batch):
     s_o = torch.stack([item["s_o"] for item in batch])
     s_h = torch.stack([item["s_h"] for item in batch])
@@ -62,12 +62,9 @@ def collate_fn(batch):
     
     s_kg = None
     if "s_kg" in batch[0]:
-        # Check if it's a list (hetero graphs) or tensor (legacy)
         if isinstance(batch[0]["s_kg"], list):
-            # Hetero graphs: keep as list
             s_kg = [item["s_kg"] for item in batch]
         else:
-            # Legacy tensor: stack
             s_kg = torch.stack([item["s_kg"] for item in batch])
         
     return {
@@ -85,26 +82,19 @@ def merge_datasets(list_of_dicts, shuffle: bool = False):
     merged = {}
     for k in keys:
         if k == "s_kg":
-            # Check type of first element
             first_kg = next((d[k] for d in list_of_dicts if d and k in d), None)
-            
             if first_kg is not None and isinstance(first_kg, list):
-                # List of graphs: extend
                 parts = []
                 for d in list_of_dicts:
                     if d and k in d:
                         parts.extend(d[k])
                 if parts: merged[k] = parts
             else:
-                # Tensor: concatenate
                 parts = [d[k] for d in list_of_dicts if d and k in d and isinstance(d[k], torch.Tensor)]
-                if parts:
-                    merged[k] = torch.cat(parts, dim=0)
+                if parts: merged[k] = torch.cat(parts, dim=0)
         else:
-            # Regular tensor merge
             parts = [d[k] for d in list_of_dicts if d and k in d and isinstance(d[k], torch.Tensor)]
-            if parts:
-                merged[k] = torch.cat(parts, dim=0)
+            if parts: merged[k] = torch.cat(parts, dim=0)
     
     if shuffle and "label" in merged:
         idx = torch.randperm(len(merged["label"]))
@@ -145,17 +135,68 @@ def evaluate(model: torch.nn.Module, data_dict: dict):
     s_kg = data_dict.get("s_kg")
     
     with torch.no_grad():
+        # [NEW] Ép nhánh News thành 0 hoàn toàn lúc đánh giá
+        s_n_zero = torch.zeros_like(data_dict["s_n"]).to(device)
+        
         acc, mcc = model(
             s_o=data_dict["s_o"].to(device),
             s_h=data_dict["s_h"].to(device),
             s_c=data_dict["s_c"].to(device),
             s_m=data_dict["s_m"].to(device),
-            s_n=data_dict["s_n"].to(device),
+            s_n=s_n_zero, # Truyền Zero Tensor
             s_kg=s_kg, 
             label=data_dict["label"].to(device),
             mode="test",
         )
     return float(acc), float(mcc)
+
+# ======================================================================
+# --- DIAGNOSTIC TEST: MACRO & KG ABLATION ---
+# ======================================================================
+def test_ablation_scenarios(model: torch.nn.Module, data_dict: dict, device):
+    """Đánh giá đóng góp của Macro và KG bằng cách che từng nhánh."""
+    print("\n" + "="*60)
+    print("🧪 ABLATION TEST: ĐÁNH GIÁ ĐÓNG GÓP CỦA MACRO VÀ KG")
+    print("="*60)
+    
+    s_o = data_dict["s_o"].to(device)
+    s_h = data_dict["s_h"].to(device)
+    s_c = data_dict["s_c"].to(device)
+    orig_s_m = data_dict["s_m"].to(device)
+    # News đã bị loại bỏ hoàn toàn khỏi phương trình
+    s_n_zero = torch.zeros_like(data_dict["s_n"]).to(device) 
+    orig_s_kg = data_dict.get("s_kg")
+    labels = data_dict["label"].long().to(device)
+    
+    scenarios = [
+        {"name": "BASELINE (Đầy đủ Price + Macro + KG)", "mask_macro": False, "mask_kg": False},
+        {"name": "MASK MACRO (Chỉ dùng Price + KG)", "mask_macro": True, "mask_kg": False},
+        {"name": "MASK KG (Chỉ dùng Price + Macro)", "mask_macro": False, "mask_kg": True},
+        {"name": "MASK CẢ MACRO VÀ KG (Chỉ dùng Price)", "mask_macro": True, "mask_kg": True}
+    ]
+    
+    model.eval()
+    with torch.no_grad():
+        for s in scenarios:
+            print(f"\n🚀 Kịch bản: {s['name']}")
+            
+            # Mask dữ liệu
+            s_m = torch.zeros_like(orig_s_m) if s["mask_macro"] else orig_s_m
+            s_kg = None if s["mask_kg"] else orig_s_kg
+            
+            # Forward để lấy dự đoán
+            logits = model(s_o, s_h, s_c, s_m, s_n_zero, s_kg=s_kg, mode="inference")
+            preds = torch.argmax(logits, dim=1)
+            
+            acc = accuracy_score(labels.cpu().numpy(), preds.cpu().numpy())
+            mcc = matthews_corrcoef(labels.cpu().numpy(), preds.cpu().numpy())
+            
+            # Thống kê distribution
+            counts = torch.bincount(preds, minlength=3).cpu().numpy()
+            print(f"   ► Phân phối : DOWN(0): {counts[0]} | FLAT(1): {counts[1]} | UP(2): {counts[2]}")
+            print(f"   ► Hiệu suất : ACC: {acc:.4f} | MCC: {mcc:.4f}")
+
+# ======================================================================
 
 # --- 5. TRAIN ---
 def train_model(train_data: dict, valid_data: dict, test_data: dict):
@@ -184,21 +225,21 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         price_dim=1,
         macro_dim=s_m_dim,
         news_dim=TrainConfig.news_embed_dim,
-        dim=TrainConfig.dim,                 
+        dim=TrainConfig.dim,                
         input_dim=TrainConfig.window_size,   
         output_dim=TrainConfig.output_dim,   
         num_head=TrainConfig.num_head,
         dropout=0.2,                          
-        class_weights=class_weights,
-        use_focal_loss=TrainConfig.use_focal_loss,
+        class_weights=None, # Tắt Class Weights để Focal Loss tự làm việc
+        use_focal_loss=True,
         use_kg=TrainConfig.use_kg,
         device=device
     ).to(device)
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=getattr(TrainConfig, "learning_rate", 1e-4), 
-        weight_decay=getattr(TrainConfig, "weight_decay", 1e-4)
+        weight_decay=1e-3  
     )
 
     best_val_mcc = -1.0
@@ -219,13 +260,20 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         for batch in train_loader:
             optimizer.zero_grad()
             
+            # [NEW] Loại bỏ News hoàn toàn
+            s_n_zero = torch.zeros_like(batch["s_n"]).to(device)
+            
+            s_m_input = batch["s_m"].to(device)
+            s_kg_input = batch.get("s_kg")
+            
+            
             loss = model(
                 s_o=batch["s_o"].to(device), 
                 s_h=batch["s_h"].to(device),
                 s_c=batch["s_c"].to(device), 
-                s_m=batch["s_m"].to(device),
-                s_n=batch["s_n"].to(device), 
-                s_kg=batch.get("s_kg"),
+                s_m=s_m_input,
+                s_n=s_n_zero, # Đưa News rỗng vào
+                s_kg=s_kg_input,
                 label=batch["label"].to(device),
                 mode="train"
             )
@@ -269,6 +317,10 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
         print("\n🔍 Run on TEST SET:")
         test_acc, test_mcc = evaluate(model, test_data)
         print(f"🏆 TEST RESULT  -> ACC: {test_acc:.4f}, MCC: {test_mcc:.4f}")
+        
+        # --- THỰC THI ABLATION TEST Ở ĐÂY ---
+        test_ablation_scenarios(model, test_data, device)
+
     else:
         print("⚠️ No best model saved.")
 
@@ -276,18 +328,15 @@ def train_model(train_data: dict, valid_data: dict, test_data: dict):
 if __name__ == "__main__":
     pkl_path = os.path.join(GlobalConfig.PROCESSED_PATH, "unified_dataset_test.pkl")
     
-    # [UPDATED] Support both legacy KG and hybrid KG
     use_kg = getattr(TrainConfig, "use_kg", False)
-    use_hetero_kg = getattr(TrainConfig, "use_hetero_kg", True)  # Default to new mode
+    use_hetero_kg = getattr(TrainConfig, "use_hetero_kg", True)  
     
     if use_kg:
         if use_hetero_kg:
-            # Use new hybrid KG
             hybrid_kg_path = os.path.join(GlobalConfig.KG_CACHE_DIR, 'hetero_kg_graphs.pkl')
             kg_path = None
             print(f"🕸️  Using HYBRID Heterogeneous KG: {hybrid_kg_path}")
         else:
-            # Use legacy KG
             kg_path = GlobalConfig.KG_PROCESSED_PATH
             hybrid_kg_path = None
             print(f"📊 Using LEGACY KG embeddings: {kg_path}")
@@ -301,7 +350,6 @@ if __name__ == "__main__":
         print(f"❌ File not found: {pkl_path}")
         raise SystemExit(1)
     
-    # [UPDATED] Init loader with both KG options
     dp = data_prepare(
         pkl_path, 
         kg_data_path=kg_path,

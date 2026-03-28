@@ -3,6 +3,11 @@ from .indicator_encoder import IndicatorSequenceEncoder
 from .macro_encoder import MacroIndicatorEncoder
 from .news_encoder import NewsEncoder # Import mới
 
+import torch.nn as nn
+from .indicator_encoder import IndicatorSequenceEncoder
+from .macro_encoder import MacroIndicatorEncoder
+from .news_encoder import NewsEncoder # Import mới
+
 class MultimodalSourceEncoding(nn.Module):
     def __init__(self, price_dim, macro_dim, news_dim, dim): # Thêm news_dim
         super().__init__()
