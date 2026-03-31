@@ -35,7 +35,7 @@ class FinegrainedMovementPrediction(nn.Module):
             nn.Linear(3 * dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
-            nn.Dropout(0.4), # [FIXED] Tăng Dropout ở lớp cuối lên 0.4 để ép model generalize
+            nn.Dropout(0.3), # [FIXED] Tăng Dropout ở lớp cuối lên 0.4 để ép model generalize
             nn.Linear(dim, num_classes)
         )
 

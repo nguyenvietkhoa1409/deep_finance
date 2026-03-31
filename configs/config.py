@@ -35,13 +35,13 @@ class GlobalConfig:
     END_DATE = '2025-06-26'
     
     # List cổ phiếu (Example)
-    TICKERS = ["TSLA", "AMZN", "MSFT", "NFLX"] 
+    TICKERS = ["TSLA", "AMZN", "AAPL", "MSFT"] # Cập nhật AAPL thay cho NFLX
     
-    # Mapping để sửa lỗi tên không nhất quán (Logic từ file gốc)
     TICKER_MAPPING = {
         'AMZN': 'AMZN', 'Amazon': 'AMZN',
         'MSFT': 'MSFT', 'Microsoft': 'MSFT',
         'TSLA': 'TSLA', 'Tesla': 'TSLA',
+        'AAPL': 'AAPL', 'Apple': 'AAPL',  # <--- THÊM DÒNG NÀY ĐỂ MỞ KHÓA DATA
         'NFLX': 'NFLX', 'Netflix': 'NFLX'
     }
     # Macro Symbols
@@ -77,23 +77,23 @@ class TrainConfig:
 
     # data
     train_ratio = 0.70  # 70% để học
-    valid_ratio = 0.15  # 15% để tinh chỉnh (chọn best model)
+    valid_ratio = 0.10  # 15% để tinh chỉnh (chọn best model)
     batch_size = 32
 
     # Window Size (T): Số ngày quá khứ dùng để dự báo.
-    window_size = 20
+    window_size = 14
     news_embed_dim = 1024 
     
     # --- MODEL HYPERPARAMETERS ---
     # Model Hidden Dimension (D): Kích thước vector sau khi encode và fusion
-    dim = 32
+    dim = 256
     # Output classes (Down, Flat, Up)
     output_dim = 3 
     #Attention heads
-    num_head = 2
+    num_head = 4
     
     # training
-    epoch_num = 250
+    epoch_num = 150
     # learning_rate = 1e-4
     learning_rate = 1e-4
     weight_decay = 1e-4

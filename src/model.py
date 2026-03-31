@@ -158,14 +158,14 @@ except ImportError:
 class StockMovementModel(nn.Module):
     def __init__(
         self, price_dim, macro_dim, news_dim, dim, input_dim, output_dim,
-        num_head, device, dropout=0.1, class_weights=None,use_focal_loss=True, use_kg=True
+        num_head, device, dropout=0.1, class_weights=None, use_focal_loss=True, use_kg=True
     ):
         super().__init__()
         self.device = device
         self.use_kg = use_kg
         self.label_smoothing = getattr(TrainConfig, 'label_smoothing', 0.1)
 
-        # 1. Encoders
+        # --- 1. Encoders ---
         self.multimodal_encoder = MultimodalSourceEncoding(
             price_dim=price_dim, macro_dim=macro_dim, news_dim=news_dim, dim=dim
         )
@@ -177,22 +177,21 @@ class StockMovementModel(nn.Module):
             )
             print("🕸️  Heterogeneous KG Module: ENABLED")
 
-        # 2. Parallel-Anchored Sequential Fusion Modules
-        # Chú ý: Cấu trúc đã được làm sạch, giữ nguyên số lượng tham số
+        # --- 2. Sequential Fusion Modules (Tiến trình dung hợp nối tiếp) ---
         self.fusion_news = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         self.fusion_macro = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
         if self.use_kg:
             self.fusion_kg = StableGatedCrossAttention(dim=dim, num_head=num_head, dropout=dropout)
 
-        # 3. Predictor
+        # --- 3. Predictor ---
         self.movement_predictor = FinegrainedMovementPrediction(
             dim=dim, window_size=input_dim, num_classes=output_dim, dropout=dropout
         )
 
-        # 4. Loss Function
+        # --- 4. Loss Function ---
         if use_focal_loss:
-            # Ưu tiên Focal Loss với Gamma = 3.0
-            self.loss_fn = FocalLoss(alpha=class_weights, gamma=3.0)
+            # Lưu ý: Đảm bảo bạn đã định nghĩa class FocalLoss ở file gốc
+            self.loss_fn = FocalLoss(alpha=class_weights, gamma=3.0) 
             print("🔧 Loss Strategy: FOCAL LOSS (Gamma=3.0)")
         else:
             self.loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=self.label_smoothing)
@@ -200,38 +199,39 @@ class StockMovementModel(nn.Module):
 
     def forward(self, s_o, s_h, s_c, s_m, s_n, s_kg=None, label=None, mode="train"):
         # --- 1. Encoding ---
+        # v_i: Price/Indicator (Tín hiệu gốc mạnh nhất)
+        # v_n: News (Nhiễu/Sparsity cao)
+        # v_m: Macro
         v_m, v_i, v_n = self.multimodal_encoder(s_o, s_h, s_c, s_m, s_n)
 
-        # --- 2. Parallel-Anchored Fusion ---
-        # GIẢI PHÁP: Luôn dùng v_i (Price thuần) làm 'stable' (Query & Gate) để đánh giá.
-        # Điều này ngăn chặn nhiễu từ News làm mù Gate của Macro/KG.
+        # --- 2. SEQUENTIAL MULTIMODAL FUSION ---
+        # [Cơ chế kế thừa Guided Fusion chuẩn Paper MSGCA]
         
-        # Bước 1: Khai thác News dựa trên Price
-        fused_news = self.fusion_news(stable=v_i, unstable=v_n)
+        # Bước 1: I + D (Price dẫn dắt dung hợp News)
+        # v_i đóng vai trò stable/query để sàng lọc v_n
+        h_id = self.fusion_news(stable=v_i, unstable=v_n)
         
-        # Bước 2: Khai thác Macro dựa trên Price
-        fused_macro = self.fusion_macro(stable=v_i, unstable=v_m)
+        # Bước 2: (I+D) + M (Feature (I+D) dẫn dắt dung hợp Macro)
+        # Dùng chính kết quả h_id vừa tạo làm stable/query để sàng lọc v_m
+        h_idm = self.fusion_macro(stable=h_id, unstable=v_m)
         
-        # Bước 3: Khai thác KG dựa trên Price
-        fused_kg = 0
+        # Bước 3: (I+D+M) + G (Feature (I+D+M) dẫn dắt dung hợp KG - Nếu có)
+        h_final = h_idm # Khởi tạo mặc định nếu không có KG
         if self.use_kg and s_kg is not None and isinstance(s_kg, list) and len(s_kg) > 0:
             v_kg = self.kg_encoder(s_kg).to(v_i.device)
-            fused_kg = self.fusion_kg(stable=v_i, unstable=v_kg)
+            # Dùng kết quả h_idm làm stable/query để sàng lọc v_kg
+            h_final = self.fusion_kg(stable=h_idm, unstable=v_kg)
 
-        # Tích hợp theo luồng (Additive Context)
-        # Bằng cách cộng dồn, tín hiệu Price (v_i) được củng cố dần qua từng lớp thông tin 
-        # mà không làm hỏng cơ chế Gating.
-        h_final = v_i + fused_news + fused_macro + fused_kg
+        # Lưu ý: Không còn phép cộng dồn "h_final = v_i + fused_news + fused_macro..."
+        # vì tín hiệu v_i (Price) đã được truyền dọc theo Highway connection của StableGatedCrossAttention!
 
         # --- 3. Prediction ---
+        # Truyền cả h_final (Đã dung hợp 3/4 lớp) và v_i (Price nguyên bản)
+        # để predictor thực hiện Skip Connection (Eq. 20 trong paper: h = h_idg ⊕ h_i)
         logits = self.movement_predictor(fused_seq=h_final, orig_seq=v_i)
         
-        # ĐÃ XÓA: torch.clamp(logits, -15, 15) -> Tránh làm chết Gradient!
-
         # --- 4. Return Output ---
         if mode == "train":
-            # KHUYẾN NGHỊ: Hãy di chuyển logic xử lý list này sang class Dataset
-            # Code dưới đây chỉ xử lý tạm thời để tránh lỗi.
             target = label if torch.is_tensor(label) else torch.tensor([x[0] for x in label], dtype=torch.long, device=self.device)
             return self.loss_fn(logits, target.long().to(self.device))
 
