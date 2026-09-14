@@ -7,19 +7,32 @@ from data_pipeline.processors.price_processor import PriceProcessor
 from data_pipeline.processors.macro_processor import MacroProcessor
 from data_pipeline.builder import DatasetBuilder
 
-def run_pipeline_with_llm_embeddings():
-    print("🚀 STARTING PIPELINE WITH MULTI-TICKER LLM EXTRACTED SIGNALS...")
+
+def run_pipeline_with_precomputed_news_embeddings():
+    """
+    Builds the unified dataset consumed by src/data_loader.py.
+
+    News embeddings are NOT computed here: they come from a separate
+    preprocessing project (LLM few-shot S-R-O triple extraction ->
+    schema-constrained triples -> quality filtering -> text embedding ->
+    confidence-weighted daily aggregation per ticker, report Section 4.2).
+    This script only ingests that project's output JSON and synchronizes it
+    with price/macro data fetched here.
+    """
+    print("🚀 STARTING PIPELINE (price + macro fetch, precomputed news embeddings)...")
 
     # ==============================================================================
-    # 1. SETUP PATHS & SMART LOAD PRECOMPUTED EMBEDDINGS
+    # 1. LOAD PRECOMPUTED NEWS EMBEDDINGS
     # ==============================================================================
-    EMBEDDING_PATH = r"D:\news_embeddings.json"
-    
-    if not os.path.exists(EMBEDDING_PATH):
-        print(f"❌ ERROR: Không tìm thấy file embeddings tại {EMBEDDING_PATH}")
+    # Expected JSON shape: { "YYYY-MM-DD": [{"equity": "TSLA", "embedding": [...]}, ...], ... }
+    EMBEDDING_PATH = os.getenv("NEWS_EMBEDDINGS_PATH", "")
+
+    if not EMBEDDING_PATH or not os.path.exists(EMBEDDING_PATH):
+        print(f"❌ ERROR: News embeddings file not found. Set NEWS_EMBEDDINGS_PATH to the "
+              f"output of the news preprocessing pipeline. (got: {EMBEDDING_PATH!r})")
         return
 
-    print(f"   📥 Đang load file embeddings từ: {EMBEDDING_PATH}")
+    print(f"   📥 Loading embeddings from: {EMBEDDING_PATH}")
     with open(EMBEDDING_PATH, 'r') as f:
         raw_embeddings = json.load(f)
 
@@ -27,125 +40,103 @@ def run_pipeline_with_llm_embeddings():
     unique_tickers = set()
     all_dates = set()
 
-    # Thuật toán tự động nhận diện và chuẩn hóa cấu trúc JSON đa mã cổ phiếu
+    # Auto-detect and normalize the embedding JSON structure.
     for key, value in raw_embeddings.items():
-        # Trường hợp 1: Key ngoài cùng là Ngày (vd: "2023-01-01")
         if key.startswith("20") or key.startswith("19"):
+            # Case 1: outer key is a date, e.g. "2023-01-01"
             clean_date = key[:10]
             all_dates.add(clean_date)
-            if clean_date not in formatted_embeddings:
-                formatted_embeddings[clean_date] = []
-            
-            # Subcase 1a: Value là list of dicts -> [{"equity": "TSLA", "embedding": [...]}, ...]
+            formatted_embeddings.setdefault(clean_date, [])
+
             if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict) and "equity" in value[0]:
                 formatted_embeddings[clean_date].extend(value)
                 for item in value:
                     unique_tickers.add(item["equity"])
-            
-            # Subcase 1b: Value là dict -> {"TSLA": [...], "AMZN": [...]}
             elif isinstance(value, dict):
                 for ticker, emb in value.items():
                     formatted_embeddings[clean_date].append({"equity": ticker, "embedding": emb})
                     unique_tickers.add(ticker)
-                    
-            # Subcase 1c: Value là list of floats (Format cũ 1 mã TSLA)
-            elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], float):
-                formatted_embeddings[clean_date].append({"equity": "TSLA", "embedding": value})
-                unique_tickers.add("TSLA")
-
-        # Trường hợp 2: Key ngoài cùng là Ticker (vd: "TSLA")
         else:
+            # Case 2: outer key is a ticker, e.g. "TSLA"
             ticker = key
             unique_tickers.add(ticker)
             if isinstance(value, dict):
                 for date_str, emb in value.items():
                     clean_date = date_str[:10]
                     all_dates.add(clean_date)
-                    if clean_date not in formatted_embeddings:
-                        formatted_embeddings[clean_date] = []
+                    formatted_embeddings.setdefault(clean_date, [])
                     formatted_embeddings[clean_date].append({"equity": ticker, "embedding": emb})
 
-    # Lấy range ngày
-    sorted_dates = sorted(list(all_dates))
+    sorted_dates = sorted(all_dates)
     start_date = sorted_dates[0]
     end_date = sorted_dates[-1]
     target_tickers = list(unique_tickers)
-    
-    print(f"   📊 Đã nhận diện {len(target_tickers)} Tickers: {target_tickers}")
-    print(f"   📊 Dataset có {len(sorted_dates)} ngày giao dịch (Từ {start_date} đến {end_date})")
 
-    # Override config động theo file data thực tế
+    print(f"   📊 Detected {len(target_tickers)} tickers: {target_tickers}")
+    print(f"   📊 {len(sorted_dates)} trading days (from {start_date} to {end_date})")
+
     GlobalConfig.TICKERS = target_tickers
-    GlobalConfig.START_DATE = start_date
-    GlobalConfig.END_DATE = end_date
 
-    # Lưu file embedding tạm thời đã chuẩn hóa để builder.py đọc
     os.makedirs(GlobalConfig.INTERIM_PATH, exist_ok=True)
     TEMP_EMBED_PATH = os.path.join(GlobalConfig.INTERIM_PATH, "temp_multi_embeddings.json")
     with open(TEMP_EMBED_PATH, 'w') as f:
         json.dump(formatted_embeddings, f)
 
     # ==============================================================================
-    # 2. Fetching Phase (Price & Macro only)
+    # 2. FETCH (Price & Macro)
     # ==============================================================================
-    print("\n--- Phase A: Fetching (Price & Macro only) ---")
+    print("\n--- Phase A: Fetching (Price & Macro) ---")
     yahoo = YahooFetcher()
-    
+
     os.makedirs(GlobalConfig.RAW_PRICE_PATH, exist_ok=True)
     os.makedirs(GlobalConfig.RAW_MACRO_PATH, exist_ok=True)
     os.makedirs(GlobalConfig.PROCESSED_PATH, exist_ok=True)
 
-    print(f"   Downloading Price Data for {target_tickers} ({start_date} to {end_date})...")
+    print(f"   Downloading price data for {target_tickers} ({start_date} to {end_date})...")
     raw_price_list = yahoo.download_data(start_date, end_date, GlobalConfig.TICKERS)
-    
-    print("   Downloading Macro Indicators...")
+
+    print("   Downloading macro indicators...")
     raw_macro = yahoo.fetch_macro_indicators(start_date, end_date, GlobalConfig.MACRO_SYMBOLS)
 
     # ==============================================================================
-    # 3. Processing Phase
+    # 3. PROCESS
     # ==============================================================================
     print("\n--- Phase B: Processing ---")
     price_proc = PriceProcessor()
     macro_proc = MacroProcessor()
 
-    print("   Processing Price & Macro...")
     price_dict = price_proc.combine_to_nested_dict(raw_price_list, GlobalConfig.TICKERS)
     processed_price_macro = macro_proc.process_and_enrich(price_dict, raw_macro)
-    
+
     trading_dates = list(processed_price_macro.keys())
     print(f"   Detected {len(trading_dates)} trading days from Yahoo Finance.")
 
-    # Dummy news_df 
-    dummy_news_df = pd.DataFrame(columns=['date', 'equity', 'title', 'content', 'summary', 'source', 'url'])
-    dummy_news_df['date'] = pd.to_datetime(dummy_news_df['date'])
+    # Raw article text/timestamps are optional here since embeddings are
+    # already precomputed; keep an empty frame with the expected schema.
+    empty_news_df = pd.DataFrame(columns=['date', 'equity', 'title', 'content', 'summary', 'source', 'url'])
+    empty_news_df['date'] = pd.to_datetime(empty_news_df['date'])
 
     # ==============================================================================
-    # 4. Building Phase (Tạo file Union cuối cùng)
+    # 4. BUILD UNIFIED DATASET
     # ==============================================================================
-    print("\n--- Phase C: Building Union File ---")
+    print("\n--- Phase C: Building Unified Dataset ---")
     builder = DatasetBuilder()
-    
-    filing_path = os.path.join(GlobalConfig.RAW_FILINGS_PATH, "final_summary_filing_data.parquet")
-    if not os.path.exists(filing_path):
-        print(f"   ⚠️ Warning: Filing file not found. Khởi tạo dataset bỏ qua filings.")
-        pd.DataFrame(columns=['filedAt', 'ticker', 'formType', 'content_summary']).to_parquet("dummy_filings.parquet")
-        filing_path = "dummy_filings.parquet"
 
     dataset = builder.create_synchronized_data(
-        processed_price_macro, 
-        dummy_news_df, 
-        filing_path,
+        processed_price_macro,
+        empty_news_df,
         embedding_path=TEMP_EMBED_PATH
     )
-    
-    output_filename = 'unified_dataset_test.pkl' # Đã bỏ đuôi TSLA
+
+    output_filename = 'unified_dataset_test.pkl'
     builder.save(dataset, filename=output_filename)
-    
-    # Clean up files tạm
-    if os.path.exists("dummy_filings.parquet"): os.remove("dummy_filings.parquet")
-    if os.path.exists(TEMP_EMBED_PATH): os.remove(TEMP_EMBED_PATH)
-    
-    print(f"\n✅ TEST PIPELINE COMPLETED! Dữ liệu của 4 Tickers đã sẵn sàng tại processed/{output_filename}")
+
+    if os.path.exists(TEMP_EMBED_PATH):
+        os.remove(TEMP_EMBED_PATH)
+
+    print(f"\n✅ PIPELINE COMPLETE. Dataset for {len(target_tickers)} tickers "
+          f"saved to processed/{output_filename}")
+
 
 if __name__ == "__main__":
-    run_pipeline_with_llm_embeddings()
+    run_pipeline_with_precomputed_news_embeddings()

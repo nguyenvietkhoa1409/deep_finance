@@ -1,67 +1,56 @@
-
 # FILE: src/predictor.py
 import torch
 import torch.nn as nn
 
+from src.modules.layers import ThreeLayerMLP
+
+
 class FinegrainedMovementPrediction(nn.Module):
     """
-    [OPTIMIZED] Hybrid: Learnable Query + Price Context
-    Sử dụng Pooling thay vì Flatten để tránh Overfitting trên dataset nhỏ
+    Prediction layer (report Section 3.5, Eq. 17-20).
+
+    g(.): a three-layer MLP that progressively collapses the time dimension,
+    applied independently (separate weights) to the fused representation and
+    to the original price representation (parallel stream, preserving the
+    unmodified price signal as a direct reference).
+
+    Eq.17/18: g(fused_seq), g(orig_seq)  -> (B, dim) each
+    Eq.19: concatenate along the feature dimension -> (B, 2*dim)
+    Eq.20: linear projection (W_c, b_c) onto the 3-class logit space
     """
-    def __init__(self, dim, window_size, num_classes=3, dropout=0.1):
+
+    def __init__(self, dim, window_size, num_classes=3, dropout=0.2):
         super().__init__()
-        
-        # Learnable query (global pattern seeker)
-        self.query_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-        
-        # Attention pooling
-        self.attn_fused = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=4, batch_first=True, dropout=dropout
+        self.dim = dim
+        self.window_size = window_size
+
+        d_in = window_size * dim
+        d_h1 = dim * 4
+        d_h2 = dim * 2
+
+        # Eq.17: time-dim compression for the fused representation
+        self.g_fused = ThreeLayerMLP(
+            d_in=d_in, d_out=dim, d_h1=d_h1, d_h2=d_h2,
+            final_activation=True, dropout=dropout
         )
-        self.attn_orig = nn.MultiheadAttention(
-            embed_dim=dim, num_heads=4, batch_first=True, dropout=dropout
-        )
-        
-        # Price context encoder (Đã sửa: input chỉ là dim, không phải dim * window_size)
-        self.price_context = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Classifier (3*dim input)
-        self.classifier = nn.Sequential(
-            nn.Linear(3 * dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Dropout(0.3), # [FIXED] Tăng Dropout ở lớp cuối lên 0.4 để ép model generalize
-            nn.Linear(dim, num_classes)
+        # Eq.18: time-dim compression for the original price representation
+        self.g_orig = ThreeLayerMLP(
+            d_in=d_in, d_out=dim, d_h1=d_h1, d_h2=d_h2,
+            final_activation=True, dropout=dropout
         )
 
+        # Eq.20: (W_c, b_c) linear projection to 3-class logits
+        self.classifier = nn.Linear(2 * dim, num_classes)
+
     def forward(self, fused_seq, orig_seq):
-        B, T, D = fused_seq.shape
-        
-        # 1. Learnable query attention (fused)
-        query = self.query_token.expand(B, -1, -1)
-        h_fused, _ = self.attn_fused(query, fused_seq, fused_seq)
-        h_fused = h_fused.squeeze(1)
-        
-        # 2. Learnable query attention (original)
-        h_orig, _ = self.attn_orig(query, orig_seq, orig_seq)
-        h_orig = h_orig.squeeze(1)
-        
-        # 3. [OPTIMIZED] Price context from ALL timesteps
-        # Thay vì dàn phẳng (Flatten) sinh ra hàng trăm ngàn tham số thừa, 
-        # dùng Global Average Pooling để lấy "ngữ cảnh giá trung bình" của cả cửa sổ.
-        # Hoặc dùng orig_seq[:, -1, :] nếu bạn muốn nhấn mạnh vào ngày gần nhất.
-        price_pooled = orig_seq.mean(dim=1)  # Shape: (B, D)
-        price_context = self.price_context(price_pooled)  # (B, D)
-        
-        # 4. Combine all three
-        combined = torch.cat([h_fused, h_orig, price_context], dim=-1)
-        
-        # 5. Classify
-        logits = self.classifier(combined)
-        
+        """
+        fused_seq, orig_seq: (B, T, dim)
+        """
+        B = fused_seq.shape[0]
+
+        h_fused = self.g_fused(fused_seq.reshape(B, -1))  # Eq.17 -> (B, dim)
+        h_orig = self.g_orig(orig_seq.reshape(B, -1))     # Eq.18 -> (B, dim)
+
+        m = torch.cat([h_fused, h_orig], dim=-1)  # Eq.19 -> (B, 2*dim)
+        logits = self.classifier(m)               # Eq.20 -> (B, num_classes)
         return logits
